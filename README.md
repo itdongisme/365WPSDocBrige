@@ -1,272 +1,232 @@
-# WPS 云文档下载服务
+# WPS文档下载中心
 
-基于 Cloudflare Worker 的 WPS 云文档外部下载服务，提供简洁的文档列表和下载功能。
+一个基于Cloudflare Workers的WPS文档下载代理服务，提供简洁的文档浏览和下载功能。
 
 ## 功能特性
 
-- 📄 文档列表展示（文件名、大小、更新时间、创建者）
-- 🔗 直接下载功能（通过 WPS API 获取真实下载链接）
-- 👁️ 在线预览支持（跳转到 WPS 分享页面）
-- 🔐 可选密码访问保护
-- 📱 响应式设计，支持移动端访问
+### 🚀 核心功能
+- **文档浏览** - 浏览WPS云文档中的文件和文件夹
+- **双下载模式** - 代理下载和直接下载两种方式
+- **搜索功能** - 支持文档名称实时搜索，可搜索多个已缓存文件夹
+- **主题切换** - 支持亮色/暗色主题自动切换
+- **文件夹导航** - 支持文件夹浏览和面包屑导航
 
-## 快速开始
+### 📥 下载方式
+1. **代理下载** (`/download/{fileId}`)
+   - 通过Cloudflare代理下载文件
+   - 无需认证，适合网络不稳定的环境
+   - 服务器代理获取文件后返回给用户
 
-### 1. 安装依赖
-```bash
-npm install
-```
+2. **直接下载** (`/direct-download/{fileId}?auth=password`)
+   - 302重定向到WPS真实下载链接
+   - 需要认证密码，下载速度更快
+   - 绕过代理，直接从WPS服务器下载
+   - 使用`Referrer-Policy: no-referrer`避免防盗链限制
+
+### 🔐 安全特性
+- **直接下载认证** - 独立的直接下载密码保护
+- **会话管理** - 认证密码自动缓存，关闭浏览器后清除
+- **密码管理** - 可手动清除保存的直接下载密码
+
+### 🎨 用户界面
+- **响应式设计** - 支持桌面端和移动端
+- **自定义弹窗** - 美观的密码输入和提示框，支持键盘操作
+- **文件图标** - 不同类型文件显示对应图标
+- **加载状态** - 智能加载提示和分页加载
+- **缓存机制** - 文件夹内容缓存30分钟，提升浏览体验
+
+## 部署指南
+
+### 1. 环境准备
+- Cloudflare账户
+- Wrangler CLI工具
 
 ### 2. 配置环境变量
 
-复制配置模板：
-```bash
-cp wrangler.toml.example wrangler.toml
-```
-
-编辑 `wrangler.toml` 文件，填入您的 WPS 认证信息：
+编辑 `wrangler.toml` 文件：
 
 ```toml
+name = "wps-docs-downloader"
+main = "worker.js"
+compatibility_date = "2025-08-19"
+
 [vars]
-WPS_GROUP_ID = "您的群组ID"
-WPS_CORP_ID = "您的企业ID" 
-WPS_COOKIES = "您的WPS Cookie字符串"
-# 可选：访问密码
-ACCESS_PASSWORD = "您的访问密码"
+# WPS相关配置
+WPS_GROUP_ID = "your_group_id"
+WPS_CORP_ID = "your_corp_id" 
+WPS_COOKIES = "your_wps_cookies_string"
+
+# 直接下载密码
+DIRECT_DOWNLOAD_PASSWORD = "your_direct_download_password"
 ```
 
-### 3. 本地开发
-```bash
-npm run dev
-```
+### 3. 获取WPS配置信息
 
-### 4. 部署到 Cloudflare
-```bash
-npm run deploy
-```
+#### 获取GROUP_ID和CORP_ID：
+1. 登录WPS云文档
+2. 进入企业空间，查看URL：`https://365.kdocs.cn/ent/{CORP_ID}/{GROUP_ID}`
+3. 从URL中提取对应的ID
 
-## 环境变量配置
+#### 获取Cookies：
+1. 在浏览器中登录WPS云文档
+2. 打开开发者工具 → Network
+3. 刷新页面，找到任意API请求
+4. 复制完整的Cookie字符串
 
-### 获取 WPS 认证信息
-
-1. **WPS_GROUP_ID**: WPS 群组ID
-2. **WPS_CORP_ID**: WPS 企业ID  
-3. **WPS_COOKIES**: 从浏览器开发者工具中获取的完整 Cookie 字符串
-
-### 安全配置
-
-4. **ACCESS_PASSWORD** (可选): 网站访问密码，保护整个网站
-5. **DIRECT_DOWNLOAD_PASSWORD** (可选): 直接下载认证密码，仅用于直接下载功能
-
-### 认证层次
-
-本系统提供两层认证机制：
-
-1. **基础访问认证** (`ACCESS_PASSWORD`)
-   - 保护整个网站访问
-   - 如果设置，用户需要先通过此认证才能看到文件列表
-
-2. **直接下载认证** (`DIRECT_DOWNLOAD_PASSWORD`) 
-   - 仅用于直接下载功能的额外安全层
-   - 如果不设置，直接下载功能将被禁用
-   - 如果设置，用户点击直接下载时需要输入此密码
-
-### Cookie 获取步骤
-
-1. 登录 WPS 云文档
-2. 打开浏览器开发者工具 (F12)
-3. 切换到 Network 标签页
-4. 刷新页面或进行操作
-5. 找到 WPS 相关请求，复制 Request Headers 中的 Cookie 值
-
-## 项目结构
-
-```
-365Worker/
-├── worker.js              # 主要应用逻辑
-├── wrangler.toml          # 本地配置（敏感信息，已忽略）
-├── wrangler.toml.example  # 配置模板
-├── package.json          # 项目依赖
-├── .gitignore            # Git忽略规则
-└── README.md             # 项目说明
-```
-
-## API 接口
-
-- `GET /` - 主页面，显示文档列表
-- `GET /api/files` - 获取文件列表 JSON
-- `GET /api/folder?folderId={id}` - 获取指定文件夹内容
-- `GET /download/{fileId}` - 通过代理下载文件
-- `GET /direct-download/{fileId}` - 302重定向直接下载
-- `POST /auth` - 密码验证接口
-
-## 下载方式
-
-本系统提供两种下载方式，用户可以根据网络环境选择：
-
-### 1. 通过代理下载 (`/download/{fileId}`)
-- **方式**: 通过Cloudflare Worker代理下载
-- **优点**: 网络不稳定时也能正常下载，有重试机制
-- **缺点**: 下载速度受Worker带宽限制
-- **适用场景**: 网络环境较差或需要稳定下载时
-
-### 2. 直接下载 (`/direct-download/{fileId}`)
-- **方式**: 302重定向到真实下载链接
-- **优点**: 下载速度更快，直接连接到WPS服务器
-- **缺点**: 依赖网络环境，可能需要代理访问
-- **适用场景**: 网络环境良好，追求下载速度时
-
-### 下载流程图
-
-```mermaid
-graph TD
-    U[用户] --> D[点击下载按钮]
-    D --> O[选择下载方式]
-    
-    O -->|代理下载| P[/download/{fileId}]
-    O -->|直接下载| R[/direct-download/{fileId}]
-    
-    P --> W1[Cloudflare Worker]
-    W1 --> A1[WPS API获取下载链接]
-    A1 --> W1
-    W1 --> F1[WPS文件服务器]
-    F1 --> W1
-    W1 --> U[用户获得文件]
-    
-    R --> W2[Cloudflare Worker]
-    W2 --> A2[WPS API获取下载链接]
-    A2 --> W2
-    W2 --> U2[302重定向]
-    U2 --> F2[WPS文件服务器]
-    F2 --> U[用户获得文件]
-```
-
-## 安全特性
-
-- Cookie 认证：使用 WPS 原始认证信息
-- 访问控制：可选密码保护
-- CORS 支持：安全的跨域访问
-- 错误处理：友好的错误提示
-- 隐私保护：敏感配置文件已添加到 .gitignore
-
-## 技术架构
-
-- **前端**：纯 HTML + CSS + JavaScript
-- **后端**：Cloudflare Worker
-- **认证**：WPS Cookie 转发
-- **下载**：两步式下载（API → 实际文件 URL）
-
-## 使用说明
-
-1. 访问部署后的域名
-2. 如设置了密码保护，先输入访问密码
-3. 浏览文档列表
-4. 点击"下载文件"直接下载，或"在线预览"在 WPS 中查看
-
-## 注意事项
-
-- WPS Cookie 有有效期限制，需定期更新
-- 文件下载链接有时效性（通常几小时）
-- 建议在 Cloudflare 中设置适当的缓存策略
-- 大文件下载可能受到 Worker 限制影响
-- **重要**：wrangler.toml 包含敏感信息，切勿提交到版本控制
-
-## 工作流程
-
-### 系统架构流程图
-
-```mermaid
-graph TB
-    subgraph "用户端"
-        U[用户浏览器] --> A[访问Worker域名]
-    end
-    
-    subgraph "Cloudflare Worker"
-        A --> B{是否有密码保护?}
-        B -->|有| C[验证密码]
-        B -->|无| D[显示文档列表]
-        C -->|正确| D
-        C -->|错误| E[返回错误]
-        
-        D --> F[用户操作]
-        F -->|下载| G[调用WPS API获取下载链接]
-        F -->|预览| H[跳转到WPS分享页面]
-        
-        G --> I[返回真实下载URL]
-        I --> J[用户下载文件]
-    end
-    
-    subgraph "WPS API"
-        G --> K[WPS文件API]
-        K --> I
-    end
-    
-    subgraph "WPS服务器"
-        J --> L[WPS文件服务器]
-        H --> M[WPS预览页面]
-    end
-```
-
-### 下载流程图
-
-```mermaid
-sequenceDiagram
-    participant U as 用户
-    participant W as Cloudflare Worker
-    participant A as WPS API
-    participant S as WPS 服务器
-    
-    U->>W: 请求文件列表
-    W->>A: 获取文件列表
-    A->>W: 返回文件数据
-    W->>U: 显示文件列表
-    
-    U->>W: 点击下载文件
-    W->>A: 请求下载链接
-    A->>W: 返回真实下载URL
-    W->>U: 重定向到下载链接
-    U->>S: 下载文件
-```
-
-### 部署流程图
-
-```mermaid
-graph LR
-    subgraph "开发环境"
-        A[本地开发] --> B[配置wrangler.toml]
-        B --> C[测试功能]
-        C --> D[本地调试]
-    end
-    
-    subgraph "部署流程"
-        D --> E[wrangler deploy]
-        E --> F[部署到Cloudflare]
-        F --> G[配置域名]
-        G --> H[设置环境变量]
-    end
-    
-    subgraph "生产环境"
-        H --> I[用户访问]
-        I --> J[正常使用]
-    end
-```
-
-## 开发
+### 4. 部署到Cloudflare Workers
 
 ```bash
 # 安装依赖
-npm install
+npm install -g wrangler
 
-# 本地开发
-npm run dev
+# 登录Cloudflare
+wrangler auth
 
-# 部署
-npm run deploy
-
-# 查看日志
-npm run tail
+# 部署服务
+wrangler deploy
 ```
+
+## API接口
+
+### 获取文件列表
+```
+GET /api/files
+```
+
+### 获取文件夹内容  
+```
+GET /api/folder?folderId={folderId}
+```
+
+### 代理下载（无需认证）
+```
+GET /download/{fileId}
+```
+
+### 直接下载（需要认证）
+```
+GET /direct-download/{fileId}?auth={password}
+```
+
+### 用户认证
+```
+POST /auth
+Content-Type: application/json
+
+{
+  "password": "direct_download_password"
+}
+```
+注意：目前只有直接下载需要认证
+
+## 使用说明
+
+### 直接下载使用
+1. 点击文件的下载按钮
+2. 选择"直接下载"
+3. 首次使用时输入直接下载密码
+4. 密码会保存在本次会话中，关闭浏览器后清除
+5. 如需重新输入密码，可点击"清除保存的密码"
+
+### 搜索功能
+- 在搜索框中输入关键词可实时搜索文档
+- 支持中英文搜索
+- 会搜索当前文件夹及已缓存的文件夹内容（最多缓存30分钟）
+
+### 文件夹浏览
+- 点击文件夹进入子目录
+- 使用面包屑导航快速跳转到上级目录
+- 文件夹内容自动缓存，提升浏览速度
+
+## 技术架构
+
+- **前端**: 原生JavaScript + CSS3，响应式设计
+- **后端**: Cloudflare Workers (Edge Computing)
+- **存储**: 无服务器架构，无需数据库
+- **缓存**: 内存缓存文件夹内容，30分钟过期
+- **认证**: 仅直接下载需要密码认证，会话级存储
+
+## 下载流程
+
+### 代理下载流程
+```
+用户请求 → WPS API获取链接 → Worker下载文件 → 返回给用户
+```
+
+### 直接下载流程
+```
+用户请求 → Worker验证密码 → WPS API获取链接 → 302重定向 → 用户直接从WPS下载
+```
+
+## 安全考虑
+
+1. **Cookie安全**: WPS Cookies包含敏感信息，请妥善保管
+2. **密码保护**: 建议设置复杂的直接下载密码
+3. **HTTPS**: Cloudflare Workers默认提供HTTPS加密
+4. **防盗链**: 使用`Referrer-Policy: no-referrer`绕过防盗链限制
+5. **会话安全**: 直接下载密码仅在会话中缓存，关闭浏览器后清除
+
+## 故障排除
+
+### 1. 下载失败
+- 检查WPS Cookies是否过期
+- 验证GROUP_ID和CORP_ID是否正确
+- 确认文件ID有效
+
+### 2. 认证问题
+- 验证DIRECT_DOWNLOAD_PASSWORD设置是否正确
+- 清除浏览器缓存重试
+- 检查直接下载密码是否正确输入
+
+### 3. 跨域错误
+代码已处理跨域问题，如遇到CORS错误：
+- 直接下载不会有CORS问题（使用302重定向）
+- 代理下载在服务端处理，避免跨域
+
+### 4. 界面问题
+- 清除浏览器缓存
+- 检查JavaScript控制台错误
+- 确认兼容性日期设置正确
+
+## 开发说明
+
+### 文件结构
+```
+├── worker.js          # 主要业务逻辑（包含HTML/CSS/JS）
+├── wrangler.toml     # Cloudflare Workers配置
+└── README.md         # 项目文档
+```
+
+### 主要功能模块
+- **文件管理**: 文件列表获取和缓存
+- **下载处理**: 代理下载和直接下载认证
+- **前端界面**: 响应式UI和主题切换
+- **搜索系统**: 实时搜索和缓存搜索
+
+### 特色技术点
+1. **单文件架构** - HTML/CSS/JS全部内嵌在worker.js中
+2. **无模板字符串** - 兼容旧版JavaScript引擎，使用字符串拼接
+3. **自定义弹窗** - 替代原生alert/prompt，提供更好体验
+4. **智能缓存** - 文件夹内容缓存减少API调用
+5. **防盗链处理** - 巧妙使用Referrer-Policy绕过限制
 
 ## 许可证
 
-本项目仅供学习和研究使用。
+MIT License
+
+## 贡献
+
+欢迎提交Issue和Pull Request来改进这个项目。
+
+## 注意事项
+
+⚠️ **重要提醒**:
+- 本项目仅供学习和个人使用
+- WPS下载链接中可能包含敏感的签名信息，请注意保护
+- 请遵守相关服务的使用条款
+- Cookie信息需定期更新以保持功能正常
+- 建议在生产环境中设置适当的访问限制
+
+---
+
+**技术支持**: 如遇问题请检查Wrangler日志和浏览器控制台输出

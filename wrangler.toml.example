@@ -1,0 +1,8 @@
+name = "wps-docs-downloader"
+main = "worker.js"
+compatibility_date = "2025-08-19"
+
+[vars]
+WPS_GROUP_ID = ""
+WPS_CORP_ID = ""
+WPS_COOKIES = "“

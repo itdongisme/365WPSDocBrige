@@ -36,10 +36,6 @@ export default {
       return handleGenerateDownloadLink(request, env);
     }
     
-    if (url.pathname === '/api/email-auth') {
-      return handleEmailAuthRequest(request, env);
-    }
-    
     return new Response('Not Found', { status: 404 });
   }
 };
@@ -83,22 +79,6 @@ async function verifyAccess(request, env) {
     }
   }
   
-  // 检查邮件认证令牌
-  const emailToken = url.searchParams.get('token');
-  const email = url.searchParams.get('email');
-  if (emailToken && email) {
-    try {
-      const decoded = JSON.parse(atob(emailToken));
-      // 检查邮件令牌签名和过期时间（1小时）
-      if (decoded.exp > Date.now() && isValidEmailToken(decoded, env)) {
-        // 邮件认证成功，设置长期认证cookie
-        return true;
-      }
-    } catch (e) {
-      // 令牌无效，忽略
-    }
-  }
-  
   return false;
 }
 
@@ -108,14 +88,6 @@ function isValidToken(decoded, env) {
   
   // 简单的签名验证
   const expected = btoa(decoded.timestamp + env.ACCESS_PASSWORD).slice(0, 16);
-  return decoded.sig === expected;
-}
-
-// 验证邮件认证令牌
-function isValidEmailToken(decoded, env) {
-  if (!env.ACCESS_PASSWORD) return false;
-  
-  const expected = btoa(decoded.timestamp + env.ACCESS_PASSWORD + decoded.random).slice(0, 16);
   return decoded.sig === expected;
 }
 
@@ -204,30 +176,6 @@ function handleAuthPage() {
 
 // 处理认证请求
 async function handleAuth(request, env) {
-  const url = new URL(request.url);
-  
-  // 处理邮件认证链接
-  const emailToken = url.searchParams.get('token');
-  const email = url.searchParams.get('email');
-  
-  if (emailToken && email) {
-    try {
-      const decoded = JSON.parse(atob(emailToken));
-      if (decoded.exp > Date.now() && isValidEmailToken(decoded, env)) {
-        // 邮件认证成功，设置长期认证cookie
-        const timestamp = Date.now();
-        const exp = timestamp + (24 * 60 * 60 * 1000); // 24小时过期
-        const token = btoa(JSON.stringify({ timestamp, exp }));
-        
-        // 重定向到主页并设置认证cookie
-        const redirectUrl = `${url.origin}/?auth=${token}`;
-        return Response.redirect(redirectUrl, 302);
-      }
-    } catch (e) {
-      // 令牌无效
-    }
-  }
-  
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405 });
   }
@@ -261,106 +209,7 @@ async function handleAuth(request, env) {
   }
 }
 
-// 发送邮件认证链接
-async function sendAuthEmail(email, env) {
-  if (!env.SMTP_HOST || !env.SMTP_PORT || !env.SMTP_USER || !env.SMTP_PASS) {
-    throw new Error('SMTP配置不完整');
-  }
-  
-  // 生成认证令牌
-  const token = generateEmailToken(env);
-  const baseUrl = env.BASE_URL || 'https://your-domain.com';
-  const authLink = `${baseUrl}/auth?token=${token}&email=${encodeURIComponent(email)}`;
-  
-  // 构建邮件内容
-  const emailContent = `
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>文档下载访问认证</title>
-</head>
-<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
-    <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
-        <h2 style="color: #2b6de7;">📚 文档下载访问认证</h2>
-        <p>您请求访问文档下载系统，请点击下面的按钮完成认证：</p>
-        
-        <div style="text-align: center; margin: 30px 0;">
-            <a href="${authLink}" style="background: #2b6de7; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
-                立即认证
-            </a>
-        </div>
-        
-        <p>或者复制以下链接到浏览器：</p>
-        <p style="word-break: break-all; background: #f5f5f5; padding: 10px; border-radius: 4px;">
-            ${authLink}
-        </p>
-        
-        <p style="color: #666; font-size: 14px;">
-            此链接将在1小时后过期，请尽快完成认证。<br>
-            如果您没有请求访问，请忽略此邮件。
-        </p>
-        
-        <hr style="margin: 20px 0; border: none; border-top: 1px solid #eee;">
-        <p style="color: #999; font-size: 12px; text-align: center;">
-            此邮件由文档下载系统自动发送
-        </p>
-    </div>
-</body>
-</html>
-  `;
-  
-  // 发送邮件 (使用Mailgun API或类似服务)
-  // 这里使用Mailgun作为示例，你可以替换为其他SMTP服务
-  const mailgunUrl = `https://api.mailgun.net/v3/${env.MAILGUN_DOMAIN}/messages`;
-  const authHeader = 'Basic ' + btoa(`api:${env.MAILGUN_API_KEY}`);
-  
-  const formData = new FormData();
-  formData.append('from', env.SMTP_FROM || `noreply@${env.MAILGUN_DOMAIN}`);
-  formData.append('to', email);
-  formData.append('subject', '文档下载访问认证');
-  formData.append('html', emailContent);
-  
-  try {
-    const response = await fetch(mailgunUrl, {
-      method: 'POST',
-      headers: {
-        'Authorization': authHeader
-      },
-      body: formData
-    });
-    
-    if (!response.ok) {
-      throw new Error('邮件发送失败');
-    }
-    
-    return true;
-  } catch (error) {
-    console.error('邮件发送错误:', error);
-    throw error;
-  }
-}
-
-// 生成邮件认证令牌
-function generateEmailToken(env) {
-  if (!env.ACCESS_PASSWORD) return null;
-  
-  const timestamp = Date.now();
-  const exp = timestamp + (60 * 60 * 1000); // 1小时过期
-  const random = Math.random().toString(36).substring(2);
-  const sig = btoa(timestamp + env.ACCESS_PASSWORD + random).slice(0, 16);
-  
-  const token = {
-    timestamp,
-    exp,
-    random,
-    sig
-  };
-  
-  return btoa(JSON.stringify(token));
-}
-
-// 生成带认证的下载链接
+// 获取文件夹内容
 async function handleGenerateDownloadLink(request, env) {
   if (!await verifyAccess(request, env)) {
     return new Response(JSON.stringify({ error: '未授权访问' }), {
@@ -395,47 +244,13 @@ async function handleGenerateDownloadLink(request, env) {
     // 构建下载链接
     const baseUrl = new URL(request.url).origin;
     const downloadUrl = direct 
-      ? `${baseUrl}/direct-download/${fileId}?token=${token}`
-      : `${baseUrl}/download/${fileId}?token=${token}`;
+      ? baseUrl + '/direct-download/' + fileId + '?token=' + token
+      : baseUrl + '/download/' + fileId + '?token=' + token;
     
     return new Response(JSON.stringify({ 
       success: true,
       downloadUrl,
       expiresAt: Date.now() + (60 * 60 * 1000) // 1小时后过期
-    }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-    
-  } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-}
-
-// 处理邮件认证请求
-async function handleEmailAuthRequest(request, env) {
-  if (request.method !== 'POST') {
-    return new Response('Method not allowed', { status: 405 });
-  }
-  
-  try {
-    const { email } = await request.json();
-    
-    if (!email || !email.includes('@')) {
-      return new Response(JSON.stringify({ error: '请输入有效的邮箱地址' }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-    
-    // 发送认证邮件
-    await sendAuthEmail(email, env);
-    
-    return new Response(JSON.stringify({ 
-      success: true,
-      message: '认证邮件已发送，请查收邮箱'
     }), {
       headers: { 'Content-Type': 'application/json' }
     });
@@ -475,7 +290,7 @@ async function handleFolderContent(request, env) {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
     'Accept': 'application/json',
     'Cookie': env.WPS_COOKIES,
-    'Referer': `https://365.kdocs.cn/ent/${corpId}/${groupId}/${folderId}`,
+    'Referer': 'https://365.kdocs.cn/ent/' + corpId + '/' + groupId + '/' + folderId,
     'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7'
   };
   
@@ -533,7 +348,7 @@ async function handleFilesList(request, env) {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
     'Accept': 'application/json',
     'Cookie': env.WPS_COOKIES,
-    'Referer': `https://365.kdocs.cn/ent/${corpId}/${groupId}`,
+    'Referer': 'https://365.kdocs.cn/ent/' + corpId + '/' + groupId,
     'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7'
   };
   
@@ -581,29 +396,20 @@ async function handleDirectDownload(request, env) {
     return new Response('Invalid file ID', { status: 400 });
   }
   
-  // 检查基础访问权限
-  if (!await verifyAccess(request, env)) {
-    return new Response('需要认证才能访问', { 
-      status: 401,
-      headers: { 'Content-Type': 'text/plain; charset=utf-8' }
-    });
-  }
-  
-  // 检查直接下载认证密码（额外的认证层）
+  // 检查直接下载认证密码
   const authPassword = url.searchParams.get('auth') || request.headers.get('X-Direct-Download-Auth');
   
   if (!env.DIRECT_DOWNLOAD_PASSWORD) {
-    // 如果没有配置直接下载密码，则禁用直接下载功能
     return new Response(JSON.stringify({ 
-      error: '直接下载功能未启用',
-      code: 'FEATURE_DISABLED'
+      error: '直接下载功能未配置密码',
+      code: 'FEATURE_NOT_CONFIGURED'
     }), {
       status: 403,
       headers: { 'Content-Type': 'application/json' }
     });
   }
   
-  if (authPassword !== env.DIRECT_DOWNLOAD_PASSWORD) {
+  if (!authPassword || authPassword !== env.DIRECT_DOWNLOAD_PASSWORD) {
     return new Response(JSON.stringify({ 
       error: '需要直接下载认证密码',
       code: 'DIRECT_AUTH_REQUIRED'
@@ -625,13 +431,13 @@ async function handleDirectDownload(request, env) {
   
   try {
     // 获取下载链接
-    const downloadApiUrl = `https://365.kdocs.cn/3rd/drive/api/v5/groups/${groupId}/files/${fileId}/download?isblocks=false&support_checksums=md5,sha1,sha224,sha256,sha384,sha512`;
+    const downloadApiUrl = 'https://365.kdocs.cn/3rd/drive/api/v5/groups/' + groupId + '/files/' + fileId + '/download?isblocks=false&support_checksums=md5,sha1,sha224,sha256,sha384,sha512';
     
     const headers = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
       'Accept': '*/*',
       'Cookie': env.WPS_COOKIES,
-      'Referer': `https://365.kdocs.cn/ent/${corpId}/${groupId}`,
+      'Referer': 'https://365.kdocs.cn/ent/' + corpId + '/' + groupId,
       'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
       'Cache-Control': 'no-cache',
       'Pragma': 'no-cache',
@@ -647,8 +453,14 @@ async function handleDirectDownload(request, env) {
       throw new Error('获取下载链接失败');
     }
     
-    // 302重定向到真实下载链接
-    return Response.redirect(downloadData.url, 302);
+    // 302重定向到真实下载链接，不发送Referer
+    return new Response(null, {
+      status: 302,
+      headers: {
+        'Location': downloadData.url,
+        'Referrer-Policy': 'no-referrer'
+      }
+    });
     
   } catch (error) {
     return new Response(JSON.stringify({ error: error.message }), {
@@ -667,14 +479,6 @@ async function handleFileDownload(request, env) {
     return new Response('Invalid file ID', { status: 400 });
   }
   
-  // 检查认证
-  if (!await verifyAccess(request, env)) {
-    return new Response('需要认证才能下载文件', { 
-      status: 401,
-      headers: { 'Content-Type': 'text/plain; charset=utf-8' }
-    });
-  }
-  
   const groupId = env.WPS_GROUP_ID;
   const corpId = env.WPS_CORP_ID;
   
@@ -687,13 +491,13 @@ async function handleFileDownload(request, env) {
   
   try {
     // 第一步：获取下载链接
-    const downloadApiUrl = `https://365.kdocs.cn/3rd/drive/api/v5/groups/${groupId}/files/${fileId}/download?isblocks=false&support_checksums=md5,sha1,sha224,sha256,sha384,sha512`;
+    const downloadApiUrl = 'https://365.kdocs.cn/3rd/drive/api/v5/groups/' + groupId + '/files/' + fileId + '/download?isblocks=false&support_checksums=md5,sha1,sha224,sha256,sha384,sha512';
     
     const headers = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
       'Accept': '*/*',
       'Cookie': env.WPS_COOKIES,
-      'Referer': `https://365.kdocs.cn/ent/${corpId}/${groupId}`,
+      'Referer': 'https://365.kdocs.cn/ent/' + corpId + '/' + groupId,
       'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
       'Cache-Control': 'no-cache',
       'Pragma': 'no-cache',
@@ -703,10 +507,34 @@ async function handleFileDownload(request, env) {
     };
     
     const downloadResponse = await fetch(downloadApiUrl, { headers });
+    
+    // 检查响应状态
+    if (!downloadResponse.ok) {
+      const errorText = await downloadResponse.text();
+      console.error('WPS API错误:', downloadResponse.status, errorText);
+      
+      // 检查是否是AccessDenied错误
+      if (errorText.includes('AccessDenied') || downloadResponse.status === 403) {
+        return new Response('WPS认证已过期，请联系管理员更新Cookie配置', {
+          status: 403,
+          headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+        });
+      }
+      
+      return new Response('WPS API调用失败: ' + downloadResponse.status, {
+        status: 502,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+      });
+    }
+    
     const downloadData = await downloadResponse.json();
     
     if (downloadData.result !== 'ok' || !downloadData.url) {
-      throw new Error('获取下载链接失败');
+      console.error('WPS API返回错误:', downloadData);
+      return new Response('无法获取下载链接: ' + (downloadData.error || '未知错误'), {
+        status: 502,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+      });
     }
     
     // 第二步：代理文件下载
@@ -1867,22 +1695,38 @@ async function handleHomePage(request, env) {
             // 创建下载菜单
             const menu = document.createElement('div');
             menu.className = 'download-menu show';
-            menu.innerHTML = `
-                <a href="/download/${fileId}" class="download-menu-item" target="_blank">
-                    <span>🌐</span>
-                    <div>
-                        <div>通过代理下载</div>
-                        <div class="download-menu-description">通过Cloudflare代理下载，适合网络不稳定的环境</div>
-                    </div>
-                </a>
-                <div class="download-menu-item" onclick="requestDirectDownload('${fileId}', '${fileName.replace(/'/g, "\\'")}')">
-                    <span>⚡</span>
-                    <div>
-                        <div>直接下载</div>
-                        <div class="download-menu-description">302重定向到真实下载链接，下载速度更快</div>
-                    </div>
-                </div>
-            `;
+            menu.innerHTML = 
+                '<a href="/download/' + fileId + '" class="download-menu-item" target="_blank">' +
+                    '<span>🌐</span>' +
+                    '<div>' +
+                        '<div>通过代理下载</div>' +
+                        '<div class="download-menu-description">通过Cloudflare代理下载，适合科学上网的环境</div>' +
+                    '</div>' +
+                '</a>' +
+                '<div class="download-menu-item" data-file-id="' + fileId + '" data-file-name="' + fileName.replace(/"/g, '&quot;') + '">' +
+                    '<span>⚡</span>' +
+                    '<div>' +
+                        '<div>直接下载</div>' +
+                        '<div class="download-menu-description">302重定向到真实下载链接，下载速度更快</div>' +
+                    '</div>' +
+                '</div>' +
+                '<div class="download-menu-item" onclick="clearDirectDownloadAuth()">' +
+                    '<span>🔄</span>' +
+                    '<div>' +
+                        '<div>清除保存的密码</div>' +
+                        '<div class="download-menu-description">重新输入直接下载密码</div>' +
+                    '</div>' +
+                '</div>';
+            
+            // 为直接下载选项添加点击事件
+            const directDownloadBtn = menu.querySelector('.download-menu-item[data-file-id]');
+            if (directDownloadBtn) {
+                directDownloadBtn.addEventListener('click', function() {
+                    const fileId = this.getAttribute('data-file-id');
+                    const fileName = this.getAttribute('data-file-name');
+                    requestDirectDownload(fileId, fileName);
+                });
+            }
             
             // 找到对应的下载按钮
             const button = event.target.closest('button');
@@ -1899,6 +1743,269 @@ async function handleHomePage(request, env) {
             menu.onclick = (e) => e.stopPropagation();
         }
         
+        // 自定义弹窗函数
+        function showCustomAlert(message, title) {
+            if (!title) title = '提示';
+            
+            // 创建遮罩层
+            const overlay = document.createElement('div');
+            overlay.style.cssText = 
+                'position: fixed;' +
+                'top: 0;' +
+                'left: 0;' +
+                'width: 100%;' +
+                'height: 100%;' +
+                'background: rgba(0, 0, 0, 0.5);' +
+                'z-index: 10000;' +
+                'display: flex;' +
+                'align-items: center;' +
+                'justify-content: center;';
+            
+            // 创建弹窗
+            const modal = document.createElement('div');
+            modal.style.cssText = 
+                'background: var(--bg-card);' +
+                'border-radius: 8px;' +
+                'box-shadow: var(--shadow-lg);' +
+                'max-width: 400px;' +
+                'width: 90%;' +
+                'padding: 0;' +
+                'color: var(--text-primary);' +
+                'border: 1px solid var(--border);';
+            
+            // 创建标题栏
+            const header = document.createElement('div');
+            header.style.cssText = 
+                'padding: 16px 20px;' +
+                'border-bottom: 1px solid var(--border);' +
+                'font-weight: 600;' +
+                'font-size: 16px;';
+            header.textContent = title;
+            
+            // 创建内容区域
+            const content = document.createElement('div');
+            content.style.cssText = 
+                'padding: 20px;' +
+                'line-height: 1.5;';
+            content.textContent = message;
+            
+            // 创建按钮区域
+            const footer = document.createElement('div');
+            footer.style.cssText = 
+                'padding: 16px 20px;' +
+                'border-top: 1px solid var(--border);' +
+                'text-align: right;';
+            
+            // 创建确定按钮
+            const button = document.createElement('button');
+            button.style.cssText = 
+                'background: var(--accent);' +
+                'color: white;' +
+                'border: none;' +
+                'border-radius: 6px;' +
+                'padding: 8px 16px;' +
+                'cursor: pointer;' +
+                'font-size: 14px;' +
+                'transition: all 0.2s ease;';
+            button.textContent = '确定';
+            button.onmouseover = function() { button.style.background = 'var(--accent-hover)'; };
+            button.onmouseout = function() { button.style.background = 'var(--accent)'; };
+            
+            // 点击确定按钮关闭弹窗
+            button.onclick = function() {
+                document.body.removeChild(overlay);
+            };
+            
+            // 组装弹窗
+            footer.appendChild(button);
+            modal.appendChild(header);
+            modal.appendChild(content);
+            modal.appendChild(footer);
+            overlay.appendChild(modal);
+            
+            // 点击遮罩层关闭弹窗
+            overlay.onclick = function(e) {
+                if (e.target === overlay) {
+                    document.body.removeChild(overlay);
+                }
+            };
+            
+            // 添加到页面
+            document.body.appendChild(overlay);
+            
+            // 聚焦按钮，支持回车键关闭
+            button.focus();
+            
+            // 支持ESC键关闭
+            const handleKeydown = function(e) {
+                if (e.key === 'Escape' || e.key === 'Enter') {
+                    document.body.removeChild(overlay);
+                    document.removeEventListener('keydown', handleKeydown);
+                }
+            };
+            document.addEventListener('keydown', handleKeydown);
+        }
+
+        // 自定义输入弹窗函数
+        function showCustomPrompt(message, title) {
+            if (!title) title = '输入';
+            
+            return new Promise(function(resolve) {
+                // 创建遮罩层
+                const overlay = document.createElement('div');
+                overlay.style.cssText = 
+                    'position: fixed;' +
+                    'top: 0;' +
+                    'left: 0;' +
+                    'width: 100%;' +
+                    'height: 100%;' +
+                    'background: rgba(0, 0, 0, 0.5);' +
+                    'z-index: 10000;' +
+                    'display: flex;' +
+                    'align-items: center;' +
+                    'justify-content: center;';
+                
+                // 创建弹窗
+                const modal = document.createElement('div');
+                modal.style.cssText = 
+                    'background: var(--bg-card);' +
+                    'border-radius: 8px;' +
+                    'box-shadow: var(--shadow-lg);' +
+                    'max-width: 400px;' +
+                    'width: 90%;' +
+                    'padding: 0;' +
+                    'color: var(--text-primary);' +
+                    'border: 1px solid var(--border);';
+                
+                // 创建标题栏
+                const header = document.createElement('div');
+                header.style.cssText = 
+                    'padding: 16px 20px;' +
+                    'border-bottom: 1px solid var(--border);' +
+                    'font-weight: 600;' +
+                    'font-size: 16px;';
+                header.textContent = title;
+                
+                // 创建内容区域
+                const content = document.createElement('div');
+                content.style.cssText = 
+                    'padding: 20px;' +
+                    'line-height: 1.5;';
+                
+                const label = document.createElement('div');
+                label.style.cssText = 'margin-bottom: 12px;';
+                label.textContent = message;
+                
+                const input = document.createElement('input');
+                input.type = 'password';
+                input.style.cssText = 
+                    'width: 100%;' +
+                    'padding: 8px 12px;' +
+                    'border: 1px solid var(--border);' +
+                    'border-radius: 4px;' +
+                    'font-size: 14px;' +
+                    'background: var(--bg-card);' +
+                    'color: var(--text-primary);' +
+                    'outline: none;' +
+                    'transition: border-color 0.2s ease;' +
+                    'box-sizing: border-box;';
+                input.onfocus = function() { input.style.borderColor = 'var(--accent)'; };
+                input.onblur = function() { input.style.borderColor = 'var(--border)'; };
+                
+                content.appendChild(label);
+                content.appendChild(input);
+                
+                // 创建按钮区域
+                const footer = document.createElement('div');
+                footer.style.cssText = 
+                    'padding: 16px 20px;' +
+                    'border-top: 1px solid var(--border);' +
+                    'text-align: right;' +
+                    'display: flex;' +
+                    'gap: 8px;' +
+                    'justify-content: flex-end;';
+                
+                // 创建取消按钮
+                const cancelButton = document.createElement('button');
+                cancelButton.style.cssText = 
+                    'background: var(--bg-card);' +
+                    'color: var(--text-secondary);' +
+                    'border: 1px solid var(--border);' +
+                    'border-radius: 6px;' +
+                    'padding: 8px 16px;' +
+                    'cursor: pointer;' +
+                    'font-size: 14px;' +
+                    'transition: all 0.2s ease;';
+                cancelButton.textContent = '取消';
+                cancelButton.onmouseover = function() {
+                    cancelButton.style.background = 'var(--bg-hover)';
+                    cancelButton.style.color = 'var(--text-primary)';
+                };
+                cancelButton.onmouseout = function() {
+                    cancelButton.style.background = 'var(--bg-card)';
+                    cancelButton.style.color = 'var(--text-secondary)';
+                };
+                
+                // 创建确定按钮
+                const okButton = document.createElement('button');
+                okButton.style.cssText = 
+                    'background: var(--accent);' +
+                    'color: white;' +
+                    'border: none;' +
+                    'border-radius: 6px;' +
+                    'padding: 8px 16px;' +
+                    'cursor: pointer;' +
+                    'font-size: 14px;' +
+                    'transition: all 0.2s ease;';
+                okButton.textContent = '确定';
+                okButton.onmouseover = function() { okButton.style.background = 'var(--accent-hover)'; };
+                okButton.onmouseout = function() { okButton.style.background = 'var(--accent)'; };
+                
+                // 点击取消按钮
+                cancelButton.onclick = function() {
+                    document.body.removeChild(overlay);
+                    resolve(null);
+                };
+                
+                // 点击确定按钮
+                okButton.onclick = function() {
+                    const value = input.value.trim();
+                    document.body.removeChild(overlay);
+                    resolve(value || null);
+                };
+                
+                // 回车键确认
+                input.onkeydown = function(e) {
+                    if (e.key === 'Enter') {
+                        okButton.click();
+                    } else if (e.key === 'Escape') {
+                        cancelButton.click();
+                    }
+                };
+                
+                // 组装弹窗
+                footer.appendChild(cancelButton);
+                footer.appendChild(okButton);
+                modal.appendChild(header);
+                modal.appendChild(content);
+                modal.appendChild(footer);
+                overlay.appendChild(modal);
+                
+                // 点击遮罩层关闭弹窗
+                overlay.onclick = function(e) {
+                    if (e.target === overlay) {
+                        cancelButton.click();
+                    }
+                };
+                
+                // 添加到页面
+                document.body.appendChild(overlay);
+                
+                // 聚焦输入框
+                setTimeout(function() { input.focus(); }, 100);
+            });
+        }
+
         // 请求直接下载（需要认证密码）
         async function requestDirectDownload(fileId, fileName) {
             hideAllDownloadMenus();
@@ -1907,46 +2014,36 @@ async function handleHomePage(request, env) {
             let authPassword = sessionStorage.getItem('directDownloadAuth');
             
             if (!authPassword) {
-                authPassword = prompt('请输入直接下载认证密码：');
+                authPassword = await showCustomPrompt('请输入直接下载认证密码：', '直接下载认证');
                 if (!authPassword) {
                     return; // 用户取消
                 }
-                
-                // 临时保存密码（仅本次会话）
-                sessionStorage.setItem('directDownloadAuth', authPassword);
             }
             
-            // 尝试直接下载
+            // 直接尝试下载 - 不做预检查，让浏览器直接处理
             try {
-                const response = await fetch(`/direct-download/${fileId}?auth=${encodeURIComponent(authPassword)}`, {
-                    method: 'HEAD' // 先检查认证是否有效
-                });
+                const downloadUrl = '/direct-download/' + fileId + '?auth=' + encodeURIComponent(authPassword);
                 
-                if (response.status === 401) {
-                    const errorData = await response.json();
-                    if (errorData.code === 'DIRECT_AUTH_REQUIRED') {
-                        // 认证密码错误，清除保存的密码并重新请求
-                        sessionStorage.removeItem('directDownloadAuth');
-                        alert('认证密码错误，请重新输入');
-                        return requestDirectDownload(fileId, fileName);
-                    }
-                } else if (response.status === 403) {
-                    alert('直接下载功能未启用');
-                    return;
-                } else if (response.ok || response.status === 302) {
-                    // 认证通过，执行下载
-                    const downloadUrl = `/direct-download/${fileId}?auth=${encodeURIComponent(authPassword)}`;
-                    window.open(downloadUrl, '_blank');
-                    return;
-                }
+                // 直接在新窗口打开下载链接
+                const downloadWindow = window.open(downloadUrl, '_blank');
                 
-                // 其他错误
-                alert('下载失败，请稍后重试');
+                // 暂存密码（仅在成功时保存）
+                sessionStorage.setItem('directDownloadAuth', authPassword);
+                
+                // 如果窗口立即关闭，可能是认证失败，但我们不做复杂检查
+                // 用户如果发现密码错误，可以手动重新点击下载
                 
             } catch (error) {
                 console.error('直接下载失败:', error);
-                alert('网络错误，请稍后重试');
+                showCustomAlert('下载失败，请稍后重试', '下载失败');
             }
+        }
+
+        // 清除保存的直接下载密码
+        function clearDirectDownloadAuth() {
+            sessionStorage.removeItem('directDownloadAuth');
+            hideAllDownloadMenus();
+            showCustomAlert('已清除保存的直接下载密码，下次使用时将重新要求输入', '密码已清除');
         }
         
         // 隐藏所有下载菜单
@@ -1964,7 +2061,10 @@ async function handleHomePage(request, env) {
             }
         });
         
-        loadFiles();
+        // 页面加载完成后初始化
+        document.addEventListener('DOMContentLoaded', function() {
+            loadFiles();
+        });
     </script>
 </body>
 </html>`;

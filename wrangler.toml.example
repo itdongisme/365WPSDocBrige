@@ -5,4 +5,8 @@ compatibility_date = "2025-08-19"
 [vars]
 WPS_GROUP_ID = ""
 WPS_CORP_ID = ""
-WPS_COOKIES = "“
+WPS_COOKIES = ""
+# 可选：网站访问密码保护
+ACCESS_PASSWORD = ""
+# 可选：直接下载认证密码（额外的安全层）
+DIRECT_DOWNLOAD_PASSWORD = ""

@@ -24,15 +24,27 @@ export default {
       return handleFileDownload(request, env);
     }
     
+    if (url.pathname.startsWith('/direct-download/')) {
+      return handleDirectDownload(request, env);
+    }
+    
     if (url.pathname === '/auth') {
       return handleAuth(request, env);
+    }
+    
+    if (url.pathname === '/api/generate-download-link') {
+      return handleGenerateDownloadLink(request, env);
+    }
+    
+    if (url.pathname === '/api/email-auth') {
+      return handleEmailAuthRequest(request, env);
     }
     
     return new Response('Not Found', { status: 404 });
   }
 };
 
-// 访问验证
+// 访问验证 - 增强版
 async function verifyAccess(request, env) {
   const url = new URL(request.url);
   
@@ -46,10 +58,82 @@ async function verifyAccess(request, env) {
   const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='));
   if (authCookie) {
     const token = authCookie.split('=')[1];
-    return token === btoa(env.ACCESS_PASSWORD);
+    try {
+      const decoded = JSON.parse(atob(token));
+      // 检查令牌是否过期（24小时）
+      if (decoded.exp > Date.now()) {
+        return true;
+      }
+    } catch (e) {
+      // 令牌格式错误，忽略
+    }
+  }
+  
+  // 检查时间令牌（用于直接下载链接）
+  const tokenParam = url.searchParams.get('token');
+  if (tokenParam) {
+    try {
+      const decoded = JSON.parse(atob(tokenParam));
+      // 检查令牌签名和过期时间（1小时）
+      if (decoded.exp > Date.now() && isValidToken(decoded, env)) {
+        return true;
+      }
+    } catch (e) {
+      // 令牌无效，忽略
+    }
+  }
+  
+  // 检查邮件认证令牌
+  const emailToken = url.searchParams.get('token');
+  const email = url.searchParams.get('email');
+  if (emailToken && email) {
+    try {
+      const decoded = JSON.parse(atob(emailToken));
+      // 检查邮件令牌签名和过期时间（1小时）
+      if (decoded.exp > Date.now() && isValidEmailToken(decoded, env)) {
+        // 邮件认证成功，设置长期认证cookie
+        return true;
+      }
+    } catch (e) {
+      // 令牌无效，忽略
+    }
   }
   
   return false;
+}
+
+// 验证时间令牌签名
+function isValidToken(decoded, env) {
+  if (!env.ACCESS_PASSWORD) return false;
+  
+  // 简单的签名验证
+  const expected = btoa(decoded.timestamp + env.ACCESS_PASSWORD).slice(0, 16);
+  return decoded.sig === expected;
+}
+
+// 验证邮件认证令牌
+function isValidEmailToken(decoded, env) {
+  if (!env.ACCESS_PASSWORD) return false;
+  
+  const expected = btoa(decoded.timestamp + env.ACCESS_PASSWORD + decoded.random).slice(0, 16);
+  return decoded.sig === expected;
+}
+
+// 生成时间令牌
+function generateToken(env) {
+  if (!env.ACCESS_PASSWORD) return null;
+  
+  const timestamp = Date.now();
+  const exp = timestamp + (60 * 60 * 1000); // 1小时过期
+  const sig = btoa(timestamp + env.ACCESS_PASSWORD).slice(0, 16);
+  
+  const token = {
+    timestamp,
+    exp,
+    sig
+  };
+  
+  return btoa(JSON.stringify(token));
 }
 
 // 认证页面
@@ -120,6 +204,30 @@ function handleAuthPage() {
 
 // 处理认证请求
 async function handleAuth(request, env) {
+  const url = new URL(request.url);
+  
+  // 处理邮件认证链接
+  const emailToken = url.searchParams.get('token');
+  const email = url.searchParams.get('email');
+  
+  if (emailToken && email) {
+    try {
+      const decoded = JSON.parse(atob(emailToken));
+      if (decoded.exp > Date.now() && isValidEmailToken(decoded, env)) {
+        // 邮件认证成功，设置长期认证cookie
+        const timestamp = Date.now();
+        const exp = timestamp + (24 * 60 * 60 * 1000); // 24小时过期
+        const token = btoa(JSON.stringify({ timestamp, exp }));
+        
+        // 重定向到主页并设置认证cookie
+        const redirectUrl = `${url.origin}/?auth=${token}`;
+        return Response.redirect(redirectUrl, 302);
+      }
+    } catch (e) {
+      // 令牌无效
+    }
+  }
+  
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405 });
   }
@@ -128,11 +236,213 @@ async function handleAuth(request, env) {
     const { password } = await request.json();
     const success = password === env.ACCESS_PASSWORD;
     
-    return new Response(JSON.stringify({ success }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
+    if (success) {
+      // 生成带过期时间的认证令牌
+      const timestamp = Date.now();
+      const exp = timestamp + (24 * 60 * 60 * 1000); // 24小时过期
+      const token = btoa(JSON.stringify({ timestamp, exp }));
+      
+      return new Response(JSON.stringify({ 
+        success, 
+        token,
+        expiresIn: 24 * 60 * 60 * 1000
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } else {
+      return new Response(JSON.stringify({ success }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
   } catch (error) {
     return new Response(JSON.stringify({ success: false }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// 发送邮件认证链接
+async function sendAuthEmail(email, env) {
+  if (!env.SMTP_HOST || !env.SMTP_PORT || !env.SMTP_USER || !env.SMTP_PASS) {
+    throw new Error('SMTP配置不完整');
+  }
+  
+  // 生成认证令牌
+  const token = generateEmailToken(env);
+  const baseUrl = env.BASE_URL || 'https://your-domain.com';
+  const authLink = `${baseUrl}/auth?token=${token}&email=${encodeURIComponent(email)}`;
+  
+  // 构建邮件内容
+  const emailContent = `
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>文档下载访问认证</title>
+</head>
+<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+    <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+        <h2 style="color: #2b6de7;">📚 文档下载访问认证</h2>
+        <p>您请求访问文档下载系统，请点击下面的按钮完成认证：</p>
+        
+        <div style="text-align: center; margin: 30px 0;">
+            <a href="${authLink}" style="background: #2b6de7; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
+                立即认证
+            </a>
+        </div>
+        
+        <p>或者复制以下链接到浏览器：</p>
+        <p style="word-break: break-all; background: #f5f5f5; padding: 10px; border-radius: 4px;">
+            ${authLink}
+        </p>
+        
+        <p style="color: #666; font-size: 14px;">
+            此链接将在1小时后过期，请尽快完成认证。<br>
+            如果您没有请求访问，请忽略此邮件。
+        </p>
+        
+        <hr style="margin: 20px 0; border: none; border-top: 1px solid #eee;">
+        <p style="color: #999; font-size: 12px; text-align: center;">
+            此邮件由文档下载系统自动发送
+        </p>
+    </div>
+</body>
+</html>
+  `;
+  
+  // 发送邮件 (使用Mailgun API或类似服务)
+  // 这里使用Mailgun作为示例，你可以替换为其他SMTP服务
+  const mailgunUrl = `https://api.mailgun.net/v3/${env.MAILGUN_DOMAIN}/messages`;
+  const authHeader = 'Basic ' + btoa(`api:${env.MAILGUN_API_KEY}`);
+  
+  const formData = new FormData();
+  formData.append('from', env.SMTP_FROM || `noreply@${env.MAILGUN_DOMAIN}`);
+  formData.append('to', email);
+  formData.append('subject', '文档下载访问认证');
+  formData.append('html', emailContent);
+  
+  try {
+    const response = await fetch(mailgunUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': authHeader
+      },
+      body: formData
+    });
+    
+    if (!response.ok) {
+      throw new Error('邮件发送失败');
+    }
+    
+    return true;
+  } catch (error) {
+    console.error('邮件发送错误:', error);
+    throw error;
+  }
+}
+
+// 生成邮件认证令牌
+function generateEmailToken(env) {
+  if (!env.ACCESS_PASSWORD) return null;
+  
+  const timestamp = Date.now();
+  const exp = timestamp + (60 * 60 * 1000); // 1小时过期
+  const random = Math.random().toString(36).substring(2);
+  const sig = btoa(timestamp + env.ACCESS_PASSWORD + random).slice(0, 16);
+  
+  const token = {
+    timestamp,
+    exp,
+    random,
+    sig
+  };
+  
+  return btoa(JSON.stringify(token));
+}
+
+// 生成带认证的下载链接
+async function handleGenerateDownloadLink(request, env) {
+  if (!await verifyAccess(request, env)) {
+    return new Response(JSON.stringify({ error: '未授权访问' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+  
+  if (request.method !== 'POST') {
+    return new Response('Method not allowed', { status: 405 });
+  }
+  
+  try {
+    const { fileId, direct = false } = await request.json();
+    
+    if (!fileId) {
+      return new Response(JSON.stringify({ error: '缺少文件ID' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    
+    // 生成访问令牌
+    const token = generateToken(env);
+    if (!token) {
+      return new Response(JSON.stringify({ error: '无法生成访问令牌' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    
+    // 构建下载链接
+    const baseUrl = new URL(request.url).origin;
+    const downloadUrl = direct 
+      ? `${baseUrl}/direct-download/${fileId}?token=${token}`
+      : `${baseUrl}/download/${fileId}?token=${token}`;
+    
+    return new Response(JSON.stringify({ 
+      success: true,
+      downloadUrl,
+      expiresAt: Date.now() + (60 * 60 * 1000) // 1小时后过期
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+    
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// 处理邮件认证请求
+async function handleEmailAuthRequest(request, env) {
+  if (request.method !== 'POST') {
+    return new Response('Method not allowed', { status: 405 });
+  }
+  
+  try {
+    const { email } = await request.json();
+    
+    if (!email || !email.includes('@')) {
+      return new Response(JSON.stringify({ error: '请输入有效的邮箱地址' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    
+    // 发送认证邮件
+    await sendAuthEmail(email, env);
+    
+    return new Response(JSON.stringify({ 
+      success: true,
+      message: '认证邮件已发送，请查收邮箱'
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+    
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
       headers: { 'Content-Type': 'application/json' }
     });
   }
@@ -262,6 +572,92 @@ async function handleFilesList(request, env) {
   }
 }
 
+// 直接下载 - 302重定向到真实下载链接
+async function handleDirectDownload(request, env) {
+  const url = new URL(request.url);
+  const fileId = url.pathname.split('/direct-download/')[1];
+  
+  if (!fileId) {
+    return new Response('Invalid file ID', { status: 400 });
+  }
+  
+  // 检查基础访问权限
+  if (!await verifyAccess(request, env)) {
+    return new Response('需要认证才能访问', { 
+      status: 401,
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  }
+  
+  // 检查直接下载认证密码（额外的认证层）
+  const authPassword = url.searchParams.get('auth') || request.headers.get('X-Direct-Download-Auth');
+  
+  if (!env.DIRECT_DOWNLOAD_PASSWORD) {
+    // 如果没有配置直接下载密码，则禁用直接下载功能
+    return new Response(JSON.stringify({ 
+      error: '直接下载功能未启用',
+      code: 'FEATURE_DISABLED'
+    }), {
+      status: 403,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+  
+  if (authPassword !== env.DIRECT_DOWNLOAD_PASSWORD) {
+    return new Response(JSON.stringify({ 
+      error: '需要直接下载认证密码',
+      code: 'DIRECT_AUTH_REQUIRED'
+    }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+  
+  const groupId = env.WPS_GROUP_ID;
+  const corpId = env.WPS_CORP_ID;
+  
+  if (!groupId || !corpId) {
+    return new Response(JSON.stringify({ error: '缺少必要的环境变量 WPS_GROUP_ID 或 WPS_CORP_ID' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+  
+  try {
+    // 获取下载链接
+    const downloadApiUrl = `https://365.kdocs.cn/3rd/drive/api/v5/groups/${groupId}/files/${fileId}/download?isblocks=false&support_checksums=md5,sha1,sha224,sha256,sha384,sha512`;
+    
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
+      'Accept': '*/*',
+      'Cookie': env.WPS_COOKIES,
+      'Referer': `https://365.kdocs.cn/ent/${corpId}/${groupId}`,
+      'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin'
+    };
+    
+    const downloadResponse = await fetch(downloadApiUrl, { headers });
+    const downloadData = await downloadResponse.json();
+    
+    if (downloadData.result !== 'ok' || !downloadData.url) {
+      throw new Error('获取下载链接失败');
+    }
+    
+    // 302重定向到真实下载链接
+    return Response.redirect(downloadData.url, 302);
+    
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
 // 文件下载代理
 async function handleFileDownload(request, env) {
   const url = new URL(request.url);
@@ -269,6 +665,14 @@ async function handleFileDownload(request, env) {
   
   if (!fileId) {
     return new Response('Invalid file ID', { status: 400 });
+  }
+  
+  // 检查认证
+  if (!await verifyAccess(request, env)) {
+    return new Response('需要认证才能下载文件', { 
+      status: 401,
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+    });
   }
   
   const groupId = env.WPS_GROUP_ID;
@@ -777,6 +1181,79 @@ async function handleHomePage(request, env) {
             transform: none;
         }
 
+        .download-options {
+            position: relative;
+            display: inline-block;
+        }
+
+        .download-menu {
+            position: absolute;
+            top: 100%;
+            right: 0;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            box-shadow: var(--shadow-lg);
+            z-index: 1000;
+            min-width: 200px;
+            display: none;
+            margin-top: 4px;
+        }
+
+        .download-menu.show {
+            display: block;
+        }
+
+        .download-menu-item {
+            padding: 12px 16px;
+            cursor: pointer;
+            border-bottom: 1px solid var(--border);
+            transition: background 0.2s ease;
+            text-decoration: none;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+        }
+
+        .download-menu-item:last-child {
+            border-bottom: none;
+        }
+
+        .download-menu-item:hover {
+            background: var(--bg-hover);
+        }
+
+        .download-menu-item:first-child {
+            border-radius: 8px 8px 0 0;
+        }
+
+        .download-menu-item:last-child {
+            border-radius: 0 0 8px 8px;
+        }
+
+        .download-menu-description {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+
+        .overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.3);
+            z-index: 999;
+            display: none;
+        }
+
+        .overlay.show {
+            display: block;
+        }
+
         .loading-more {
             text-align: center;
             margin: 20px 0;
@@ -921,6 +1398,7 @@ async function handleHomePage(request, env) {
             <button class="load-more-btn" id="loadMoreBtn">加载更多</button>
         </div>
         <div id="stats" class="stats" style="display: none;"></div>
+        <div class="overlay" id="overlay"></div>
     </div>
 
     <script>
@@ -1314,10 +1792,12 @@ async function handleHomePage(request, env) {
                                     <span>打开</span>
                                 </button>
                             \` : \`
-                                <a href="/download/\${file.id}" class="btn btn-primary" target="_blank">
-                                    <span>📥</span>
-                                    <span>下载</span>
-                                </a>
+                                <div class="download-options">
+                                    <button class="btn btn-primary" onclick="showDownloadOptions('\${file.id}', '\${file.fname}')">
+                                        <span>📥</span>
+                                        <span>下载</span>
+                                    </button>
+                                </div>
                                 <a href="\${file.link_url}" class="btn btn-secondary" target="_blank">
                                     <span>👁️</span>
                                     <span>预览</span>
@@ -1378,6 +1858,111 @@ async function handleHomePage(request, env) {
                 document.getElementById('loadingMore').style.display = 'none';
             }, 300);
         }
+        
+        // 显示下载选项
+        function showDownloadOptions(fileId, fileName) {
+            // 隐藏其他已打开的菜单
+            hideAllDownloadMenus();
+            
+            // 创建下载菜单
+            const menu = document.createElement('div');
+            menu.className = 'download-menu show';
+            menu.innerHTML = `
+                <a href="/download/${fileId}" class="download-menu-item" target="_blank">
+                    <span>🌐</span>
+                    <div>
+                        <div>通过代理下载</div>
+                        <div class="download-menu-description">通过Cloudflare代理下载，适合网络不稳定的环境</div>
+                    </div>
+                </a>
+                <div class="download-menu-item" onclick="requestDirectDownload('${fileId}', '${fileName.replace(/'/g, "\\'")}')">
+                    <span>⚡</span>
+                    <div>
+                        <div>直接下载</div>
+                        <div class="download-menu-description">302重定向到真实下载链接，下载速度更快</div>
+                    </div>
+                </div>
+            `;
+            
+            // 找到对应的下载按钮
+            const button = event.target.closest('button');
+            const container = button.closest('.download-options');
+            container.appendChild(menu);
+            
+            // 显示遮罩层
+            document.getElementById('overlay').classList.add('show');
+            
+            // 点击遮罩层关闭菜单
+            document.getElementById('overlay').onclick = hideAllDownloadMenus;
+            
+            // 阻止菜单内部点击事件冒泡
+            menu.onclick = (e) => e.stopPropagation();
+        }
+        
+        // 请求直接下载（需要认证密码）
+        async function requestDirectDownload(fileId, fileName) {
+            hideAllDownloadMenus();
+            
+            // 检查是否已保存认证密码
+            let authPassword = sessionStorage.getItem('directDownloadAuth');
+            
+            if (!authPassword) {
+                authPassword = prompt('请输入直接下载认证密码：');
+                if (!authPassword) {
+                    return; // 用户取消
+                }
+                
+                // 临时保存密码（仅本次会话）
+                sessionStorage.setItem('directDownloadAuth', authPassword);
+            }
+            
+            // 尝试直接下载
+            try {
+                const response = await fetch(`/direct-download/${fileId}?auth=${encodeURIComponent(authPassword)}`, {
+                    method: 'HEAD' // 先检查认证是否有效
+                });
+                
+                if (response.status === 401) {
+                    const errorData = await response.json();
+                    if (errorData.code === 'DIRECT_AUTH_REQUIRED') {
+                        // 认证密码错误，清除保存的密码并重新请求
+                        sessionStorage.removeItem('directDownloadAuth');
+                        alert('认证密码错误，请重新输入');
+                        return requestDirectDownload(fileId, fileName);
+                    }
+                } else if (response.status === 403) {
+                    alert('直接下载功能未启用');
+                    return;
+                } else if (response.ok || response.status === 302) {
+                    // 认证通过，执行下载
+                    const downloadUrl = `/direct-download/${fileId}?auth=${encodeURIComponent(authPassword)}`;
+                    window.open(downloadUrl, '_blank');
+                    return;
+                }
+                
+                // 其他错误
+                alert('下载失败，请稍后重试');
+                
+            } catch (error) {
+                console.error('直接下载失败:', error);
+                alert('网络错误，请稍后重试');
+            }
+        }
+        
+        // 隐藏所有下载菜单
+        function hideAllDownloadMenus() {
+            document.querySelectorAll('.download-menu').forEach(menu => {
+                menu.remove();
+            });
+            document.getElementById('overlay').classList.remove('show');
+        }
+        
+        // 点击页面其他地方关闭菜单
+        document.addEventListener('click', (e) => {
+            if (!e.target.closest('.download-options')) {
+                hideAllDownloadMenus();
+            }
+        });
         
         loadFiles();
     </script>

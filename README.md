@@ -7,6 +7,8 @@
 ### 🚀 核心功能
 - **文档浏览** - 浏览WPS云文档中的文件和文件夹
 - **双下载模式** - 代理下载和直接下载两种方式
+- **R2 缓存系统** - 自动缓存下载文件到 Cloudflare R2，提供快速访问
+- **LRU 缓存管理** - 智能缓存淘汰策略，自动管理存储空间
 - **搜索功能** - 支持文档名称实时搜索，可搜索多个已缓存文件夹
 - **主题切换** - 支持亮色/暗色主题自动切换
 - **文件夹导航** - 支持文件夹浏览和面包屑导航
@@ -16,12 +18,19 @@
    - 通过Cloudflare代理下载文件
    - 无需认证，适合网络不稳定的环境
    - 服务器代理获取文件后返回给用户
+   - **支持 R2 缓存**：文件自动缓存到 R2，后续访问直接从缓存提供
 
 2. **直接下载** (`/direct-download/{fileId}?auth=password`)
    - 302重定向到WPS真实下载链接
    - 需要认证密码，下载速度更快
    - 绕过代理，直接从WPS服务器下载
    - 使用`Referrer-Policy: no-referrer`避免防盗链限制
+
+### 💾 缓存系统
+- **自动缓存** - 通过代理下载的文件自动存储到 R2
+- **LRU 淘汰** - 基于最近最少使用算法管理缓存空间
+- **容量限制** - 缓存容量上限 9GB，接近限制时自动清理旧文件
+- **缓存命中** - 已缓存文件直接从 R2 提供，响应更快
 
 ### 🔐 安全特性
 - **直接下载认证** - 独立的直接下载密码保护
@@ -58,9 +67,38 @@ WPS_COOKIES = "your_wps_cookies_string"
 
 # 直接下载密码
 DIRECT_DOWNLOAD_PASSWORD = "your_direct_download_password"
+
+# R2 存储桶配置（用于缓存文件）
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "wps-docs-cache"
+
+# KV 命名空间配置（用于存储文件元数据和 LRU 链表）
+[[kv_namespaces]]
+binding = "CACHE_KV"
+id = "your-kv-namespace-id"
+preview_id = "your-preview-kv-namespace-id"
 ```
 
-### 3. 获取WPS配置信息
+### 3. 创建 R2 存储桶和 KV 命名空间
+
+#### 创建 R2 存储桶：
+```bash
+# 创建 R2 存储桶
+wrangler r2 bucket create wps-docs-cache
+```
+
+#### 创建 KV 命名空间：
+```bash
+# 创建 KV 命名空间
+wrangler kv:namespace create "CACHE_KV"
+# 创建预览环境的 KV 命名空间
+wrangler kv:namespace create "CACHE_KV" --preview
+```
+
+将输出的 ID 填入 `wrangler.toml` 的相应位置。
+
+### 4. 获取WPS配置信息
 
 #### 获取GROUP_ID和CORP_ID：
 1. 登录WPS云文档
@@ -73,7 +111,7 @@ DIRECT_DOWNLOAD_PASSWORD = "your_direct_download_password"
 3. 刷新页面，找到任意API请求
 4. 复制完整的Cookie字符串
 
-### 4. 部署到Cloudflare Workers
+### 5. 部署到Cloudflare Workers
 
 ```bash
 # 安装依赖
@@ -118,6 +156,36 @@ Content-Type: application/json
 }
 ```
 注意：目前只有直接下载需要认证
+
+### 缓存统计信息
+```
+GET /api/cache-stats
+```
+
+返回缓存系统的统计信息，包括总大小、文件数量、使用率等。
+
+### 缓存文件列表
+```
+GET /api/cache-list?page=1&pageSize=20&sortBy=lastAccessed
+```
+
+获取缓存中的文件列表，支持分页和排序。
+
+### 清理缓存
+```
+POST /api/cache-clear
+Content-Type: application/json
+
+# 清空所有缓存
+{
+  "clearAll": true
+}
+
+# 删除指定文件
+{
+  "fileId": "abc123"
+}
+```
 
 ## 使用说明
 
@@ -202,6 +270,7 @@ Content-Type: application/json
 - **下载处理**: 代理下载和直接下载认证
 - **前端界面**: 响应式UI和主题切换
 - **搜索系统**: 实时搜索和缓存搜索
+- **缓存系统**: R2存储和LRU缓存管理
 
 ### 特色技术点
 1. **单文件架构** - HTML/CSS/JS全部内嵌在worker.js中

@@ -36,6 +36,19 @@ export default {
       return handleGenerateDownloadLink(request, env);
     }
     
+    // 缓存管理接口
+    if (url.pathname === '/api/cache-stats') {
+      return handleCacheStats(request, env);
+    }
+    
+    if (url.pathname === '/api/cache-list') {
+      return handleCacheList(request, env);
+    }
+    
+    if (url.pathname === '/api/cache-clear') {
+      return handleCacheClear(request, env);
+    }
+    
     return new Response('Not Found', { status: 404 });
   }
 };
@@ -470,7 +483,7 @@ async function handleDirectDownload(request, env) {
   }
 }
 
-// 文件下载代理
+// 文件下载代理 - 支持 R2 缓存
 async function handleFileDownload(request, env) {
   const url = new URL(request.url);
   const fileId = url.pathname.split('/download/')[1];
@@ -487,6 +500,17 @@ async function handleFileDownload(request, env) {
       status: 500,
       headers: { 'Content-Type': 'application/json' }
     });
+  }
+  
+  // 检查 R2 和 KV 是否配置
+  const useCache = env.R2_BUCKET && env.CACHE_KV;
+  
+  if (useCache) {
+    // 尝试从缓存获取文件
+    const cachedResponse = await getCachedFile(fileId, env);
+    if (cachedResponse) {
+      return cachedResponse;
+    }
   }
   
   try {
@@ -544,11 +568,44 @@ async function handleFileDownload(request, env) {
       throw new Error('文件下载失败');
     }
     
+    // 获取文件信息
+    const contentType = fileResponse.headers.get('Content-Type') || 'application/octet-stream';
+    const contentDisposition = fileResponse.headers.get('Content-Disposition') || 'attachment';
+    const contentLength = fileResponse.headers.get('Content-Length');
+    
+    // 如果启用缓存，保存文件到 R2
+    if (useCache && contentLength) {
+      // 克隆响应体，因为 body 只能读取一次
+      const [body1, body2] = fileResponse.body.tee();
+      
+      // 异步保存到缓存（不阻塞响应）
+      env.waitUntil(
+        saveToCache(fileId, body2, {
+          contentType,
+          contentDisposition,
+          contentLength: parseInt(contentLength),
+          fileName: extractFileName(contentDisposition)
+        }, env)
+      );
+      
+      // 返回第一个 body 流给用户
+      return new Response(body1, {
+        headers: {
+          'Content-Type': contentType,
+          'Content-Disposition': contentDisposition,
+          'Content-Length': contentLength || '',
+          'Access-Control-Allow-Origin': '*',
+          'X-Cache': 'MISS'
+        }
+      });
+    }
+    
+    // 不使用缓存，直接返回
     return new Response(fileResponse.body, {
       headers: {
-        'Content-Type': fileResponse.headers.get('Content-Type') || 'application/octet-stream',
-        'Content-Disposition': fileResponse.headers.get('Content-Disposition') || 'attachment',
-        'Content-Length': fileResponse.headers.get('Content-Length') || '',
+        'Content-Type': contentType,
+        'Content-Disposition': contentDisposition,
+        'Content-Length': contentLength || '',
         'Access-Control-Allow-Origin': '*'
       }
     });
@@ -2072,4 +2129,462 @@ async function handleHomePage(request, env) {
   return new Response(html, {
     headers: { 'Content-Type': 'text/html; charset=utf-8' }
   });
+}
+
+// =================== R2 缓存相关函数 ===================
+
+// 从缓存获取文件
+async function getCachedFile(fileId, env) {
+  try {
+    // 从 KV 获取文件元数据
+    const metadata = await env.CACHE_KV.get(`file:${fileId}`, 'json');
+    if (!metadata) {
+      return null;
+    }
+    
+    // 从 R2 获取文件
+    const object = await env.R2_BUCKET.get(`files/${fileId}`);
+    if (!object) {
+      // 文件不存在，清理 KV 记录
+      await env.CACHE_KV.delete(`file:${fileId}`);
+      return null;
+    }
+    
+    // 更新访问时间
+    await updateAccessTime(fileId, env);
+    
+    // 返回缓存的文件
+    return new Response(object.body, {
+      headers: {
+        'Content-Type': metadata.contentType || 'application/octet-stream',
+        'Content-Disposition': metadata.contentDisposition || 'attachment',
+        'Content-Length': metadata.contentLength || '',
+        'Access-Control-Allow-Origin': '*',
+        'X-Cache': 'HIT',
+        'X-Cache-Time': new Date(metadata.cachedAt).toISOString()
+      }
+    });
+  } catch (error) {
+    console.error('获取缓存文件失败:', error);
+    return null;
+  }
+}
+
+// 保存文件到缓存
+async function saveToCache(fileId, body, metadata, env) {
+  try {
+    const now = Date.now();
+    
+    // 检查是否需要清理缓存
+    await checkAndCleanCache(metadata.contentLength, env);
+    
+    // 保存文件到 R2
+    await env.R2_BUCKET.put(`files/${fileId}`, body, {
+      customMetadata: {
+        fileName: metadata.fileName || '',
+        contentType: metadata.contentType || '',
+        cachedAt: now.toString()
+      }
+    });
+    
+    // 保存元数据到 KV
+    const fileMetadata = {
+      fileId,
+      fileName: metadata.fileName,
+      contentType: metadata.contentType,
+      contentDisposition: metadata.contentDisposition,
+      contentLength: metadata.contentLength,
+      cachedAt: now,
+      lastAccessedAt: now
+    };
+    
+    await env.CACHE_KV.put(`file:${fileId}`, JSON.stringify(fileMetadata));
+    
+    // 更新 LRU 链表
+    await updateLRUList(fileId, env);
+    
+    // 更新缓存统计
+    await updateCacheStats(metadata.contentLength, env);
+    
+    console.log(`文件已缓存: ${fileId}, 大小: ${formatBytes(metadata.contentLength)}`);
+  } catch (error) {
+    console.error('保存到缓存失败:', error);
+  }
+}
+
+// 更新文件访问时间
+async function updateAccessTime(fileId, env) {
+  try {
+    const metadata = await env.CACHE_KV.get(`file:${fileId}`, 'json');
+    if (metadata) {
+      metadata.lastAccessedAt = Date.now();
+      await env.CACHE_KV.put(`file:${fileId}`, JSON.stringify(metadata));
+      
+      // 更新 LRU 链表
+      await updateLRUList(fileId, env);
+    }
+  } catch (error) {
+    console.error('更新访问时间失败:', error);
+  }
+}
+
+// 更新 LRU 链表
+async function updateLRUList(fileId, env) {
+  try {
+    // 获取当前 LRU 链表
+    let lruList = await env.CACHE_KV.get('lru:list', 'json') || [];
+    
+    // 移除文件ID（如果存在）
+    lruList = lruList.filter(id => id !== fileId);
+    
+    // 将文件ID添加到链表头部（最近使用）
+    lruList.unshift(fileId);
+    
+    // 保存更新后的链表
+    await env.CACHE_KV.put('lru:list', JSON.stringify(lruList));
+  } catch (error) {
+    console.error('更新LRU链表失败:', error);
+  }
+}
+
+// 检查并清理缓存
+async function checkAndCleanCache(newFileSize, env) {
+  try {
+    // 获取当前缓存统计
+    const stats = await env.CACHE_KV.get('cache:stats', 'json') || { totalSize: 0, fileCount: 0 };
+    
+    // 缓存大小限制（9GB）
+    const maxCacheSize = 9 * 1024 * 1024 * 1024; // 9GB
+    const targetSize = 8.5 * 1024 * 1024 * 1024; // 清理到 8.5GB，留出缓冲空间
+    
+    // 如果添加新文件后会超过限制，执行清理
+    if (stats.totalSize + newFileSize > maxCacheSize) {
+      console.log(`缓存即将超限，开始清理... 当前: ${formatBytes(stats.totalSize)}, 新文件: ${formatBytes(newFileSize)}`);
+      
+      // 获取 LRU 链表
+      const lruList = await env.CACHE_KV.get('lru:list', 'json') || [];
+      let freedSize = 0;
+      const toDelete = [];
+      
+      // 从链表尾部（最久未使用）开始删除
+      for (let i = lruList.length - 1; i >= 0; i--) {
+        const fileId = lruList[i];
+        const metadata = await env.CACHE_KV.get(`file:${fileId}`, 'json');
+        
+        if (metadata) {
+          toDelete.push({ fileId, size: metadata.contentLength });
+          freedSize += metadata.contentLength;
+          
+          // 如果释放的空间足够，停止
+          if (stats.totalSize - freedSize <= targetSize) {
+            break;
+          }
+        }
+      }
+      
+      // 执行删除
+      for (const file of toDelete) {
+        await deleteFromCache(file.fileId, env);
+      }
+      
+      console.log(`缓存清理完成，删除 ${toDelete.length} 个文件，释放 ${formatBytes(freedSize)}`);
+    }
+  } catch (error) {
+    console.error('缓存清理失败:', error);
+  }
+}
+
+// 从缓存删除文件
+async function deleteFromCache(fileId, env) {
+  try {
+    // 获取文件元数据
+    const metadata = await env.CACHE_KV.get(`file:${fileId}`, 'json');
+    if (!metadata) return;
+    
+    // 从 R2 删除文件
+    await env.R2_BUCKET.delete(`files/${fileId}`);
+    
+    // 从 KV 删除元数据
+    await env.CACHE_KV.delete(`file:${fileId}`);
+    
+    // 从 LRU 链表移除
+    let lruList = await env.CACHE_KV.get('lru:list', 'json') || [];
+    lruList = lruList.filter(id => id !== fileId);
+    await env.CACHE_KV.put('lru:list', JSON.stringify(lruList));
+    
+    // 更新缓存统计
+    await updateCacheStats(-metadata.contentLength, env);
+    
+    console.log(`已删除缓存文件: ${fileId}, ${metadata.fileName}`);
+  } catch (error) {
+    console.error('删除缓存文件失败:', error);
+  }
+}
+
+// 更新缓存统计
+async function updateCacheStats(sizeChange, env) {
+  try {
+    const stats = await env.CACHE_KV.get('cache:stats', 'json') || { totalSize: 0, fileCount: 0 };
+    
+    stats.totalSize += sizeChange;
+    stats.fileCount += sizeChange > 0 ? 1 : -1;
+    stats.lastUpdated = Date.now();
+    
+    // 确保不会出现负数
+    stats.totalSize = Math.max(0, stats.totalSize);
+    stats.fileCount = Math.max(0, stats.fileCount);
+    
+    await env.CACHE_KV.put('cache:stats', JSON.stringify(stats));
+  } catch (error) {
+    console.error('更新缓存统计失败:', error);
+  }
+}
+
+// 从 Content-Disposition 提取文件名
+function extractFileName(contentDisposition) {
+  if (!contentDisposition) return '';
+  
+  // 尝试匹配 filename*=UTF-8''encoded_filename
+  let match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (match) {
+    return decodeURIComponent(match[1]);
+  }
+  
+  // 尝试匹配 filename="filename"
+  match = contentDisposition.match(/filename="([^"]+)"/i);
+  if (match) {
+    return match[1];
+  }
+  
+  // 尝试匹配 filename=filename
+  match = contentDisposition.match(/filename=([^;]+)/i);
+  if (match) {
+    return match[1].trim();
+  }
+  
+  return '';
+}
+
+// 格式化字节大小
+function formatBytes(bytes, decimals = 2) {
+  if (bytes === 0) return '0 Bytes';
+  
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+  
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
+// =================== 缓存管理接口 ===================
+
+// 获取缓存统计信息
+async function handleCacheStats(request, env) {
+  if (!env.R2_BUCKET || !env.CACHE_KV) {
+    return new Response(JSON.stringify({ 
+      error: '缓存功能未配置',
+      enabled: false 
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+  
+  try {
+    const stats = await env.CACHE_KV.get('cache:stats', 'json') || { totalSize: 0, fileCount: 0 };
+    const lruList = await env.CACHE_KV.get('lru:list', 'json') || [];
+    
+    return new Response(JSON.stringify({
+      enabled: true,
+      totalSize: stats.totalSize,
+      totalSizeFormatted: formatBytes(stats.totalSize),
+      fileCount: stats.fileCount,
+      maxSize: 9 * 1024 * 1024 * 1024,
+      maxSizeFormatted: '9 GB',
+      usagePercent: ((stats.totalSize / (9 * 1024 * 1024 * 1024)) * 100).toFixed(2),
+      lastUpdated: stats.lastUpdated ? new Date(stats.lastUpdated).toISOString() : null,
+      lruCount: lruList.length
+    }), {
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// 获取缓存文件列表
+async function handleCacheList(request, env) {
+  if (!env.R2_BUCKET || !env.CACHE_KV) {
+    return new Response(JSON.stringify({ error: '缓存功能未配置' }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+  
+  try {
+    const url = new URL(request.url);
+    const page = parseInt(url.searchParams.get('page') || '1');
+    const pageSize = parseInt(url.searchParams.get('pageSize') || '20');
+    const sortBy = url.searchParams.get('sortBy') || 'lastAccessed'; // lastAccessed | size | name
+    
+    // 获取 LRU 链表
+    const lruList = await env.CACHE_KV.get('lru:list', 'json') || [];
+    
+    // 获取所有文件元数据
+    const files = [];
+    for (const fileId of lruList) {
+      const metadata = await env.CACHE_KV.get(`file:${fileId}`, 'json');
+      if (metadata) {
+        files.push(metadata);
+      }
+    }
+    
+    // 排序
+    if (sortBy === 'size') {
+      files.sort((a, b) => b.contentLength - a.contentLength);
+    } else if (sortBy === 'name') {
+      files.sort((a, b) => (a.fileName || '').localeCompare(b.fileName || ''));
+    }
+    // 默认按 lastAccessedAt 排序（LRU 顺序）
+    
+    // 分页
+    const start = (page - 1) * pageSize;
+    const end = start + pageSize;
+    const paginatedFiles = files.slice(start, end);
+    
+    // 格式化文件信息
+    const formattedFiles = paginatedFiles.map(file => ({
+      fileId: file.fileId,
+      fileName: file.fileName || 'Unknown',
+      size: file.contentLength,
+      sizeFormatted: formatBytes(file.contentLength),
+      contentType: file.contentType,
+      cachedAt: new Date(file.cachedAt).toISOString(),
+      lastAccessedAt: new Date(file.lastAccessedAt).toISOString(),
+      downloadUrl: `/download/${file.fileId}`
+    }));
+    
+    return new Response(JSON.stringify({
+      files: formattedFiles,
+      pagination: {
+        page,
+        pageSize,
+        total: files.length,
+        totalPages: Math.ceil(files.length / pageSize)
+      }
+    }), {
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// 清理缓存
+async function handleCacheClear(request, env) {
+  if (!env.R2_BUCKET || !env.CACHE_KV) {
+    return new Response(JSON.stringify({ error: '缓存功能未配置' }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+  
+  // 验证请求方法
+  if (request.method !== 'POST') {
+    return new Response(JSON.stringify({ error: '请使用 POST 方法' }), {
+      status: 405,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+  
+  try {
+    const body = await request.json();
+    const { fileId, clearAll = false } = body;
+    
+    if (clearAll) {
+      // 清空所有缓存
+      const lruList = await env.CACHE_KV.get('lru:list', 'json') || [];
+      let deletedCount = 0;
+      let deletedSize = 0;
+      
+      for (const id of lruList) {
+        const metadata = await env.CACHE_KV.get(`file:${id}`, 'json');
+        if (metadata) {
+          deletedSize += metadata.contentLength;
+          await deleteFromCache(id, env);
+          deletedCount++;
+        }
+      }
+      
+      // 重置统计信息
+      await env.CACHE_KV.put('cache:stats', JSON.stringify({ 
+        totalSize: 0, 
+        fileCount: 0,
+        lastUpdated: Date.now()
+      }));
+      await env.CACHE_KV.put('lru:list', JSON.stringify([]));
+      
+      return new Response(JSON.stringify({
+        success: true,
+        message: '缓存已清空',
+        deletedCount,
+        deletedSize,
+        deletedSizeFormatted: formatBytes(deletedSize)
+      }), {
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    } else if (fileId) {
+      // 删除指定文件
+      const metadata = await env.CACHE_KV.get(`file:${fileId}`, 'json');
+      if (!metadata) {
+        return new Response(JSON.stringify({ error: '文件不存在' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      await deleteFromCache(fileId, env);
+      
+      return new Response(JSON.stringify({
+        success: true,
+        message: '文件已删除',
+        fileId,
+        fileName: metadata.fileName,
+        deletedSize: metadata.contentLength,
+        deletedSizeFormatted: formatBytes(metadata.contentLength)
+      }), {
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    } else {
+      return new Response(JSON.stringify({ error: '请指定 fileId 或设置 clearAll 为 true' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
 }

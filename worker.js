@@ -21,7 +21,7 @@ export default {
     }
     
     if (url.pathname.startsWith('/download/')) {
-      return handleFileDownload(request, env);
+      return handleCachedFileDownload(request, env);
     }
     
     if (url.pathname.startsWith('/direct-download/')) {
@@ -34,6 +34,14 @@ export default {
     
     if (url.pathname === '/api/generate-download-link') {
       return handleGenerateDownloadLink(request, env);
+    }
+    
+    if (url.pathname === '/api/cache/status') {
+      return handleCacheStatus(request, env);
+    }
+    
+    if (url.pathname === '/api/cache/clear') {
+      return handleClearCache(request, env);
     }
     
     return new Response('Not Found', { status: 404 });
@@ -560,6 +568,556 @@ async function handleFileDownload(request, env) {
     });
   }
 }
+
+// ============= R2 + KV LRU 缓存系统 =============
+
+// LRU 缓存管理常量
+const CACHE_CONFIG = {
+  MAX_STORAGE_BYTES: 9 * 1024 * 1024 * 1024, // 9GB
+  LRU_HEAD_KEY: 'lru:head',
+  LRU_TAIL_KEY: 'lru:tail',
+  CACHE_SIZE_KEY: 'cache:size',
+  FILE_PREFIX: 'file:',
+  METADATA_PREFIX: 'meta:'
+};
+
+// 缓存文件下载处理器（新的主要入口）
+async function handleCachedFileDownload(request, env) {
+  const url = new URL(request.url);
+  const fileId = url.pathname.split('/download/')[1];
+  
+  if (!fileId) {
+    return new Response('Invalid file ID', { status: 400 });
+  }
+
+  try {
+    // 1. 检查 R2 缓存
+    const cachedFile = await getCachedFile(fileId, env);
+    if (cachedFile) {
+      console.log(`Cache hit for file: ${fileId}`);
+      // 更新 LRU 位置
+      await updateLRUAccess(fileId, env);
+      return cachedFile;
+    }
+
+    console.log(`Cache miss for file: ${fileId}, downloading from WPS...`);
+    
+    // 2. 缓存未命中，从 WPS 下载
+    const downloadResult = await downloadFromWPS(fileId, env);
+    if (!downloadResult.success) {
+      return downloadResult.response;
+    }
+
+    // 3. 存储到缓存
+    await cacheFile(fileId, downloadResult.fileData, downloadResult.metadata, env);
+    
+    // 4. 返回文件
+    return new Response(downloadResult.fileData, {
+      headers: downloadResult.headers
+    });
+
+  } catch (error) {
+    console.error('Cached download error:', error);
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// 从 R2 获取缓存文件
+async function getCachedFile(fileId, env) {
+  try {
+    const object = await env.FILE_CACHE.get(fileId);
+    if (!object) {
+      return null;
+    }
+
+    // 获取文件元数据
+    const metadata = await env.CACHE_KV.get(`${CACHE_CONFIG.METADATA_PREFIX}${fileId}`, 'json');
+    if (!metadata) {
+      // 元数据丢失，删除孤立的文件
+      await env.FILE_CACHE.delete(fileId);
+      return null;
+    }
+
+    const fileData = await object.arrayBuffer();
+    
+    return new Response(fileData, {
+      headers: {
+        'Content-Type': metadata.contentType || 'application/octet-stream',
+        'Content-Disposition': metadata.contentDisposition || 'attachment',
+        'Content-Length': metadata.size.toString(),
+        'Access-Control-Allow-Origin': '*',
+        'X-Cache': 'HIT'
+      }
+    });
+  } catch (error) {
+    console.error('Error getting cached file:', error);
+    return null;
+  }
+}
+
+// 从 WPS 下载文件（复制原逻辑）
+async function downloadFromWPS(fileId, env) {
+  const groupId = env.WPS_GROUP_ID;
+  const corpId = env.WPS_CORP_ID;
+  
+  if (!groupId || !corpId) {
+    return {
+      success: false,
+      response: new Response(JSON.stringify({ error: '缺少必要的环境变量 WPS_GROUP_ID 或 WPS_CORP_ID' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    };
+  }
+
+  try {
+    // 第一步：获取下载链接
+    const downloadApiUrl = 'https://365.kdocs.cn/3rd/drive/api/v5/groups/' + groupId + '/files/' + fileId + '/download?isblocks=false&support_checksums=md5,sha1,sha224,sha256,sha384,sha512';
+    
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
+      'Accept': '*/*',
+      'Cookie': env.WPS_COOKIES,
+      'Referer': 'https://365.kdocs.cn/ent/' + corpId + '/' + groupId,
+      'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin'
+    };
+    
+    const downloadResponse = await fetch(downloadApiUrl, { headers });
+    
+    if (!downloadResponse.ok) {
+      const errorText = await downloadResponse.text();
+      console.error('WPS API错误:', downloadResponse.status, errorText);
+      
+      if (errorText.includes('AccessDenied') || downloadResponse.status === 403) {
+        return {
+          success: false,
+          response: new Response('WPS认证已过期，请联系管理员更新Cookie配置', {
+            status: 403,
+            headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+          })
+        };
+      }
+      
+      return {
+        success: false,
+        response: new Response('WPS API调用失败: ' + downloadResponse.status, {
+          status: 502,
+          headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+        })
+      };
+    }
+    
+    const downloadData = await downloadResponse.json();
+    
+    if (downloadData.result !== 'ok' || !downloadData.url) {
+      console.error('WPS API返回错误:', downloadData);
+      return {
+        success: false,
+        response: new Response('无法获取下载链接: ' + (downloadData.error || '未知错误'), {
+          status: 502,
+          headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+        })
+      };
+    }
+    
+    // 第二步：下载文件
+    const fileResponse = await fetch(downloadData.url);
+    
+    if (!fileResponse.ok) {
+      throw new Error('文件下载失败');
+    }
+
+    const fileData = await fileResponse.arrayBuffer();
+    const contentType = fileResponse.headers.get('Content-Type') || 'application/octet-stream';
+    const contentDisposition = fileResponse.headers.get('Content-Disposition') || 'attachment';
+    const size = fileData.byteLength;
+
+    return {
+      success: true,
+      fileData,
+      metadata: {
+        contentType,
+        contentDisposition,
+        size,
+        downloadUrl: downloadData.url,
+        cachedAt: Date.now()
+      },
+      headers: {
+        'Content-Type': contentType,
+        'Content-Disposition': contentDisposition,
+        'Content-Length': size.toString(),
+        'Access-Control-Allow-Origin': '*',
+        'X-Cache': 'MISS'
+      }
+    };
+
+  } catch (error) {
+    return {
+      success: false,
+      response: new Response(JSON.stringify({ error: error.message }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    };
+  }
+}
+
+// 将文件存储到缓存
+async function cacheFile(fileId, fileData, metadata, env) {
+  try {
+    // 检查是否需要清理空间
+    await ensureStorageSpace(metadata.size, env);
+
+    // 存储文件到 R2
+    await env.FILE_CACHE.put(fileId, fileData, {
+      customMetadata: {
+        contentType: metadata.contentType,
+        size: metadata.size.toString(),
+        cachedAt: metadata.cachedAt.toString()
+      }
+    });
+
+    // 存储元数据到 KV
+    await env.CACHE_KV.put(`${CACHE_CONFIG.METADATA_PREFIX}${fileId}`, JSON.stringify(metadata));
+
+    // 添加到 LRU 链表
+    await addToLRU(fileId, metadata.size, env);
+
+    console.log(`File cached: ${fileId}, size: ${metadata.size} bytes`);
+  } catch (error) {
+    console.error('Error caching file:', error);
+    // 清理可能的部分状态
+    try {
+      await env.FILE_CACHE.delete(fileId);
+      await env.CACHE_KV.delete(`${CACHE_CONFIG.METADATA_PREFIX}${fileId}`);
+    } catch (cleanupError) {
+      console.error('Error during cleanup:', cleanupError);
+    }
+    throw error;
+  }
+}
+
+// LRU 链表管理 - 添加新文件
+async function addToLRU(fileId, size, env) {
+  const now = Date.now();
+  const nodeData = {
+    fileId,
+    size,
+    accessTime: now,
+    prev: null,
+    next: null
+  };
+
+  // 获取当前头节点
+  const headKey = await env.CACHE_KV.get(CACHE_CONFIG.LRU_HEAD_KEY);
+  
+  if (!headKey) {
+    // 第一个节点
+    await env.CACHE_KV.put(`${CACHE_CONFIG.FILE_PREFIX}${fileId}`, JSON.stringify(nodeData));
+    await env.CACHE_KV.put(CACHE_CONFIG.LRU_HEAD_KEY, fileId);
+    await env.CACHE_KV.put(CACHE_CONFIG.LRU_TAIL_KEY, fileId);
+  } else {
+    // 添加到头部
+    const headNode = await env.CACHE_KV.get(`${CACHE_CONFIG.FILE_PREFIX}${headKey}`, 'json');
+    headNode.prev = fileId;
+    nodeData.next = headKey;
+    
+    await env.CACHE_KV.put(`${CACHE_CONFIG.FILE_PREFIX}${fileId}`, JSON.stringify(nodeData));
+    await env.CACHE_KV.put(`${CACHE_CONFIG.FILE_PREFIX}${headKey}`, JSON.stringify(headNode));
+    await env.CACHE_KV.put(CACHE_CONFIG.LRU_HEAD_KEY, fileId);
+  }
+
+  // 更新总大小
+  await updateCacheSize(size, env);
+}
+
+// LRU 链表管理 - 更新访问
+async function updateLRUAccess(fileId, env) {
+  const nodeData = await env.CACHE_KV.get(`${CACHE_CONFIG.FILE_PREFIX}${fileId}`, 'json');
+  if (!nodeData) return;
+
+  const headKey = await env.CACHE_KV.get(CACHE_CONFIG.LRU_HEAD_KEY);
+  
+  // 如果已经是头节点，只更新访问时间
+  if (headKey === fileId) {
+    nodeData.accessTime = Date.now();
+    await env.CACHE_KV.put(`${CACHE_CONFIG.FILE_PREFIX}${fileId}`, JSON.stringify(nodeData));
+    return;
+  }
+
+  // 从当前位置移除
+  await removeFromLRU(fileId, env, false);
+  
+  // 添加到头部
+  nodeData.accessTime = Date.now();
+  nodeData.prev = null;
+  nodeData.next = headKey;
+  
+  if (headKey) {
+    const headNode = await env.CACHE_KV.get(`${CACHE_CONFIG.FILE_PREFIX}${headKey}`, 'json');
+    headNode.prev = fileId;
+    await env.CACHE_KV.put(`${CACHE_CONFIG.FILE_PREFIX}${headKey}`, JSON.stringify(headNode));
+  }
+  
+  await env.CACHE_KV.put(`${CACHE_CONFIG.FILE_PREFIX}${fileId}`, JSON.stringify(nodeData));
+  await env.CACHE_KV.put(CACHE_CONFIG.LRU_HEAD_KEY, fileId);
+}
+
+// LRU 链表管理 - 移除节点
+async function removeFromLRU(fileId, env, updateSize = true) {
+  const nodeData = await env.CACHE_KV.get(`${CACHE_CONFIG.FILE_PREFIX}${fileId}`, 'json');
+  if (!nodeData) return;
+
+  const { prev, next, size } = nodeData;
+
+  // 更新前驱节点
+  if (prev) {
+    const prevNode = await env.CACHE_KV.get(`${CACHE_CONFIG.FILE_PREFIX}${prev}`, 'json');
+    prevNode.next = next;
+    await env.CACHE_KV.put(`${CACHE_CONFIG.FILE_PREFIX}${prev}`, JSON.stringify(prevNode));
+  } else {
+    // 是头节点
+    await env.CACHE_KV.put(CACHE_CONFIG.LRU_HEAD_KEY, next || '');
+  }
+
+  // 更新后继节点
+  if (next) {
+    const nextNode = await env.CACHE_KV.get(`${CACHE_CONFIG.FILE_PREFIX}${next}`, 'json');
+    nextNode.prev = prev;
+    await env.CACHE_KV.put(`${CACHE_CONFIG.FILE_PREFIX}${next}`, JSON.stringify(nextNode));
+  } else {
+    // 是尾节点
+    await env.CACHE_KV.put(CACHE_CONFIG.LRU_TAIL_KEY, prev || '');
+  }
+
+  // 删除节点数据
+  await env.CACHE_KV.delete(`${CACHE_CONFIG.FILE_PREFIX}${fileId}`);
+  
+  if (updateSize) {
+    await updateCacheSize(-size, env);
+  }
+}
+
+// 确保有足够的存储空间
+async function ensureStorageSpace(requiredSize, env) {
+  const currentSize = await getCurrentCacheSize(env);
+  
+  if (currentSize + requiredSize <= CACHE_CONFIG.MAX_STORAGE_BYTES) {
+    return; // 空间足够
+  }
+
+  // 需要清理空间
+  let freedSpace = 0;
+  const tailKey = await env.CACHE_KV.get(CACHE_CONFIG.LRU_TAIL_KEY);
+  let currentTail = tailKey;
+
+  while (currentTail && (currentSize + requiredSize - freedSpace > CACHE_CONFIG.MAX_STORAGE_BYTES)) {
+    const nodeData = await env.CACHE_KV.get(`${CACHE_CONFIG.FILE_PREFIX}${currentTail}`, 'json');
+    if (!nodeData) break;
+
+    const { prev, size } = nodeData;
+    
+    // 删除文件
+    try {
+      await env.FILE_CACHE.delete(currentTail);
+      await env.CACHE_KV.delete(`${CACHE_CONFIG.METADATA_PREFIX}${currentTail}`);
+      freedSpace += size;
+      
+      console.log(`Deleted cached file: ${currentTail}, freed: ${size} bytes`);
+    } catch (error) {
+      console.error(`Error deleting cached file ${currentTail}:`, error);
+    }
+
+    // 移除 LRU 节点
+    await removeFromLRU(currentTail, env);
+    
+    currentTail = prev;
+  }
+
+  console.log(`Cache cleanup completed. Freed: ${freedSpace} bytes`);
+}
+
+// 获取当前缓存大小
+async function getCurrentCacheSize(env) {
+  const sizeStr = await env.CACHE_KV.get(CACHE_CONFIG.CACHE_SIZE_KEY);
+  return sizeStr ? parseInt(sizeStr) : 0;
+}
+
+// 更新缓存大小
+async function updateCacheSize(delta, env) {
+  const currentSize = await getCurrentCacheSize(env);
+  const newSize = Math.max(0, currentSize + delta);
+  await env.CACHE_KV.put(CACHE_CONFIG.CACHE_SIZE_KEY, newSize.toString());
+}
+
+// 缓存状态 API
+async function handleCacheStatus(request, env) {
+  try {
+    const currentSize = await getCurrentCacheSize(env);
+    const headKey = await env.CACHE_KV.get(CACHE_CONFIG.LRU_HEAD_KEY);
+    const tailKey = await env.CACHE_KV.get(CACHE_CONFIG.LRU_TAIL_KEY);
+    
+    // 统计文件数量
+    let fileCount = 0;
+    let currentNode = headKey;
+    const files = [];
+    
+    while (currentNode && fileCount < 50) { // 最多显示50个文件，避免响应太大
+      const nodeData = await env.CACHE_KV.get(`${CACHE_CONFIG.FILE_PREFIX}${currentNode}`, 'json');
+      if (!nodeData) break;
+      
+      files.push({
+        fileId: currentNode,
+        size: nodeData.size,
+        accessTime: nodeData.accessTime,
+        accessTimeFormatted: new Date(nodeData.accessTime).toISOString()
+      });
+      
+      fileCount++;
+      currentNode = nodeData.next;
+    }
+    
+    const status = {
+      totalSize: currentSize,
+      totalSizeFormatted: formatBytes(currentSize),
+      maxSize: CACHE_CONFIG.MAX_STORAGE_BYTES,
+      maxSizeFormatted: formatBytes(CACHE_CONFIG.MAX_STORAGE_BYTES),
+      usagePercentage: ((currentSize / CACHE_CONFIG.MAX_STORAGE_BYTES) * 100).toFixed(2),
+      fileCount: fileCount,
+      headFile: headKey,
+      tailFile: tailKey,
+      recentFiles: files
+    };
+    
+    return new Response(JSON.stringify(status, null, 2), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// 清理缓存 API
+async function handleClearCache(request, env) {
+  try {
+    const url = new URL(request.url);
+    const action = url.searchParams.get('action');
+    
+    if (action === 'all') {
+      // 清理所有缓存
+      let deletedCount = 0;
+      let deletedSize = 0;
+      
+      const headKey = await env.CACHE_KV.get(CACHE_CONFIG.LRU_HEAD_KEY);
+      let currentNode = headKey;
+      
+      while (currentNode) {
+        const nodeData = await env.CACHE_KV.get(`${CACHE_CONFIG.FILE_PREFIX}${currentNode}`, 'json');
+        if (!nodeData) break;
+        
+        try {
+          await env.FILE_CACHE.delete(currentNode);
+          await env.CACHE_KV.delete(`${CACHE_CONFIG.METADATA_PREFIX}${currentNode}`);
+          await env.CACHE_KV.delete(`${CACHE_CONFIG.FILE_PREFIX}${currentNode}`);
+          deletedCount++;
+          deletedSize += nodeData.size;
+        } catch (error) {
+          console.error(`Error deleting file ${currentNode}:`, error);
+        }
+        
+        currentNode = nodeData.next;
+      }
+      
+      // 重置 LRU 指针和大小
+      await env.CACHE_KV.delete(CACHE_CONFIG.LRU_HEAD_KEY);
+      await env.CACHE_KV.delete(CACHE_CONFIG.LRU_TAIL_KEY);
+      await env.CACHE_KV.put(CACHE_CONFIG.CACHE_SIZE_KEY, '0');
+      
+      return new Response(JSON.stringify({
+        message: 'Cache cleared successfully',
+        deletedFiles: deletedCount,
+        deletedSize: deletedSize,
+        deletedSizeFormatted: formatBytes(deletedSize)
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+      
+    } else if (action === 'old') {
+      // 只清理旧文件（超过一周的）
+      const oneWeekAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+      let deletedCount = 0;
+      let deletedSize = 0;
+      
+      const tailKey = await env.CACHE_KV.get(CACHE_CONFIG.LRU_TAIL_KEY);
+      let currentNode = tailKey;
+      
+      while (currentNode) {
+        const nodeData = await env.CACHE_KV.get(`${CACHE_CONFIG.FILE_PREFIX}${currentNode}`, 'json');
+        if (!nodeData || nodeData.accessTime > oneWeekAgo) break;
+        
+        const prevNode = nodeData.prev;
+        
+        try {
+          await env.FILE_CACHE.delete(currentNode);
+          await env.CACHE_KV.delete(`${CACHE_CONFIG.METADATA_PREFIX}${currentNode}`);
+          await removeFromLRU(currentNode, env);
+          deletedCount++;
+          deletedSize += nodeData.size;
+        } catch (error) {
+          console.error(`Error deleting old file ${currentNode}:`, error);
+        }
+        
+        currentNode = prevNode;
+      }
+      
+      return new Response(JSON.stringify({
+        message: 'Old cache files cleared successfully',
+        deletedFiles: deletedCount,
+        deletedSize: deletedSize,
+        deletedSizeFormatted: formatBytes(deletedSize)
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    
+    return new Response(JSON.stringify({
+      error: 'Invalid action. Use ?action=all or ?action=old'
+    }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' }
+    });
+    
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// 格式化字节大小
+function formatBytes(bytes) {
+  if (bytes === 0) return '0 Bytes';
+  
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+// ============= 缓存系统结束 =============
 
 // 主页面
 async function handleHomePage(request, env) {

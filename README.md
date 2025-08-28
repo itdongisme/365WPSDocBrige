@@ -1,3 +1,61 @@
+## WPS → R2 缓存下载网关（LRU/容量上限）
+
+本项目通过 Cloudflare Worker 将第三方下载源（如 WPS 365 的真实下载链接）转存到 R2，并在达到容量上限（默认 9 GiB）时，按 LRU（最近最少使用）策略自动淘汰最久未使用的对象，避免直接代理第三方下载或暴露真实链接。
+
+### 架构概览
+- Worker 提供两个核心能力：
+  - 缓存入口：`GET /cache?src=<encoded_url>&filename=<optional>`
+    - 若对象已存在于 R2：直接返回 302 跳转到 `GET /d/<key>`（或直接流式返回）。
+    - 若不存在：Worker 从 `src` 拉取，流式写入 R2；完成后更新 LRU，并根据容量上限执行逐出。
+  - 下载出口：`GET /d/<key>` 从 R2 读取并流式返回（可支持范围请求）。
+- Durable Object（LRU 协调器）
+  - 维护元数据：`key → { size, createdAt, lastAccessAt }` 与累计 `totalSize`。
+  - 负责 LRU 更新、容量校验与逐出（直接删除 R2 对象）。
+  - 以单实例（name=global）串行化并发，避免竞态。
+
+### 关键特性
+- 尺寸上限：`MAX_BYTES`（默认 9 GiB）。
+- 源站域名白名单：`ALLOWED_SRC_HOSTS`（逗号分隔）。可用 `ALLOW_ALL_SOURCES=true` 放开限制。
+- 通过 DO 的“简易锁”避免同一 key 的重复拉取；未获得锁的请求将轮询等待对象就绪。
+- R2 私有：下载通过 Worker 出口，避免暴露真实来源或 R2 公有 URL。
+
+### 快速开始
+1) 配置 `wrangler.toml` 中的 R2、DO 绑定与变量。
+2) 创建 R2 存储桶（与 `wrangler.toml` 一致）。
+3) 部署：
+```bash
+npm i -D wrangler @cloudflare/workers-types typescript
+npx wrangler deploy
+```
+
+### 典型用法
+- 触发缓存：
+```
+GET /cache?src=<URL_ENCODED_REAL_LINK>&filename=report.pdf
+```
+- 下载（由 /cache 跳转）：
+```
+GET /d/<key>
+```
+
+### 注意事项（合规/安全）
+- 请确认将第三方内容复制到 R2 的行为符合对方服务条款与您的使用场景。
+- 默认为私有存储与受控出口，减少身份与来源暴露风险。
+- 可按需补充域名白名单，避免被用作开放代理。
+ - 不直接以 Worker 代理下载第三方内容给终端用户，改为先写入 R2 再从 R2 提供下载，降低违反 Cloudflare ToS 的风险。
+
+### 运行前准备
+1) 在 Cloudflare 创建 R2 存储桶，命名与 `wrangler.toml` 中的 `bucket_name` 保持一致（默认 `wps-cache-bucket`）。
+2) 开通 Durable Objects，并在 `wrangler.toml` 中包含 `LruCoordinator` 的 migration。
+3) 如需放开来源域名限制，设置 `ALLOW_ALL_SOURCES=true`（不建议生产开启）。
+
+### 部署命令
+```bash
+npm i
+npx wrangler deploy
+```
+
+
 # WPS文档下载中心
 
 一个基于Cloudflare Workers的WPS文档下载代理服务，提供简洁的文档浏览和下载功能。

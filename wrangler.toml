@@ -1,0 +1,28 @@
+name = "wps-r2-cache-gateway"
+main = "src/worker.ts"
+compatibility_date = "2024-08-01"
+
+r2_buckets = [
+  { binding = "CACHE_BUCKET", bucket_name = "wps-cache-bucket" }
+]
+
+durable_objects = { bindings = [
+  { name = "LRU_COORD", class_name = "LruCoordinator" }
+] }
+
+[[migrations]]
+tag = "v1"
+new_classes = ["LruCoordinator"]
+
+[vars]
+MAX_BYTES = "9663676416" # 9 GiB
+ALLOW_ALL_SOURCES = "false"
+ALLOWED_SRC_HOSTS = "doc.wps.cn,wps.cn,ks3-cn-beijing.ksyun.com"
+DOWNLOAD_ROUTE_PREFIX = "/d/"
+CACHE_ROUTE = "/cache"
+LOCK_TTL_MS = "600000" # 10 minutes
+PREFETCH_WINDOW_MS = "0"
+
+[observability]
+enabled = true
+

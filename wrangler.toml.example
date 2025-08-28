@@ -10,3 +10,14 @@ WPS_COOKIES = ""
 ACCESS_PASSWORD = ""
 # 可选：直接下载认证密码（额外的安全层）
 DIRECT_DOWNLOAD_PASSWORD = ""
+
+# R2 存储桶配置（用于缓存文件）
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "wps-docs-cache"
+
+# KV 命名空间配置（用于存储文件元数据和 LRU 链表）
+[[kv_namespaces]]
+binding = "CACHE_KV"
+id = "your-kv-namespace-id"
+preview_id = "your-preview-kv-namespace-id"
